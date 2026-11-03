@@ -17,6 +17,18 @@ import webbrowser
 from pathlib import Path
 
 APP_NAME = "AquaAudit"
+_LOG_PATHS: list[Path] = []
+
+
+def log(msg: str) -> None:
+    """نوشتن در فایل لاگ (برنامه بدون کنسول است؛ خطاها فقط از اینجا دیده می‌شوند)."""
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n"
+    for p in _LOG_PATHS:
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 def data_dir() -> Path:
@@ -61,12 +73,33 @@ def initial_password(d: Path) -> str | None:
     return None
 
 
+def _serve(server) -> None:
+    import traceback
+    try:
+        server.run()
+    except BaseException:
+        log("خطای سرور:\n" + traceback.format_exc())
+
+
 def main(argv: list[str]) -> int:
+    import traceback
+    try:
+        return _main(argv)
+    except BaseException:
+        log("خطای برنامه:\n" + traceback.format_exc())
+        return 1
+
+
+def _main(argv: list[str]) -> int:
     smoke = "--smoke" in argv
     d = data_dir()
     if smoke:  # تست خودکار: داده موقت و جداگانه
         import tempfile
         d = Path(tempfile.mkdtemp(prefix="aqua_smoke_"))
+    _LOG_PATHS.append(d / "desktop.log")
+    if os.environ.get("AQUA_SMOKE_LOG"):
+        _LOG_PATHS.append(Path(os.environ["AQUA_SMOKE_LOG"]))
+    log(f"شروع؛ frozen={getattr(sys, 'frozen', False)} python={sys.version.split()[0]} data={d}")
     os.environ.setdefault("AQUA_DATA_DIR", str(d))
     os.environ.setdefault("AQUA_DEMO", "1")  # مجتمع نمونه فرضی برای ارزیابی اولیه؛ با AQUA_DEMO=0 غیرفعال می‌شود
 
@@ -76,11 +109,11 @@ def main(argv: list[str]) -> int:
     port = free_port(int(os.environ.get("PORT", "8000")))
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None, access_log=False)
     server = uvicorn.Server(config)
-    t = threading.Thread(target=server.run, daemon=True)
+    t = threading.Thread(target=_serve, args=(server,), daemon=True)
     t.start()
 
     if not wait_health(port):
-        print("سرور راه‌اندازی نشد", file=sys.stderr)
+        log("سرور تا ۳۰ ثانیه پاسخ نداد")
         return 1
     url = f"http://127.0.0.1:{port}/"
 
@@ -89,7 +122,7 @@ def main(argv: list[str]) -> int:
             ok = r.status == 200 and "AquaAudit" in r.read().decode("utf-8")
         server.should_exit = True
         t.join(timeout=10)
-        print("SMOKE OK" if ok else "SMOKE FAIL")
+        log("SMOKE OK" if ok else "SMOKE FAIL")
         return 0 if ok else 1
 
     if "--no-browser" not in argv:

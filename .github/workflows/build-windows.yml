@@ -39,7 +39,9 @@ jobs:
       - name: Smoke test built exe
         shell: pwsh
         run: |
+          $env:AQUA_SMOKE_LOG = Join-Path $env:RUNNER_TEMP "smoke.log"
           $p = Start-Process -FilePath dist\AquaAudit\AquaAudit.exe -ArgumentList "--smoke" -Wait -PassThru
+          if (Test-Path $env:AQUA_SMOKE_LOG) { Get-Content $env:AQUA_SMOKE_LOG }
           if ($p.ExitCode -ne 0) { throw "smoke test failed, exit code $($p.ExitCode)" }
           Write-Host "exe smoke test OK"
 
@@ -66,7 +68,9 @@ jobs:
           $i = Start-Process -FilePath $setup.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir" -Wait -PassThru
           if ($i.ExitCode -ne 0) { throw "installer failed, exit code $($i.ExitCode)" }
           if (-not (Test-Path "$dir\AquaAudit.exe")) { throw "AquaAudit.exe not installed" }
+          $env:AQUA_SMOKE_LOG = Join-Path $env:RUNNER_TEMP "smoke2.log"
           $p = Start-Process -FilePath "$dir\AquaAudit.exe" -ArgumentList "--smoke" -Wait -PassThru
+          if (Test-Path $env:AQUA_SMOKE_LOG) { Get-Content $env:AQUA_SMOKE_LOG }
           if ($p.ExitCode -ne 0) { throw "installed exe smoke test failed" }
           Write-Host "installer + installed exe OK"
 
