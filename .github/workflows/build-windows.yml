@@ -1,0 +1,91 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # فقط برای پیوست کردن فایل‌ها به Release هنگام push تگ v*
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt pyinstaller
+
+      - name: Run tests
+        run: python -m pytest -q tests/test_engine.py tests/test_api.py
+
+      - name: Build app (PyInstaller)
+        run: >
+          pyinstaller --noconfirm --clean --name AquaAudit --windowed --onedir
+          --add-data "static;static"
+          --collect-submodules app --collect-submodules uvicorn
+          --hidden-import multipart --hidden-import python_multipart
+          desktop.py
+
+      - name: Smoke test built exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\AquaAudit\AquaAudit.exe -ArgumentList "--smoke" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "smoke test failed, exit code $($p.ExitCode)" }
+          Write-Host "exe smoke test OK"
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/v*") { $v = $env:GITHUB_REF.Substring(11) } else { $v = "0.1.0-" + $env:GITHUB_SHA.Substring(0,7) }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.ver.outputs.version }} installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem installer_out
+
+      - name: Test silent install + run installed exe
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem installer_out\AquaAudit-Setup-*.exe | Select-Object -First 1
+          $dir = Join-Path $env:RUNNER_TEMP "AquaAuditInstalled"
+          $i = Start-Process -FilePath $setup.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir" -Wait -PassThru
+          if ($i.ExitCode -ne 0) { throw "installer failed, exit code $($i.ExitCode)" }
+          if (-not (Test-Path "$dir\AquaAudit.exe")) { throw "AquaAudit.exe not installed" }
+          $p = Start-Process -FilePath "$dir\AquaAudit.exe" -ArgumentList "--smoke" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installed exe smoke test failed" }
+          Write-Host "installer + installed exe OK"
+
+      - name: Zip portable build
+        shell: pwsh
+        run: Compress-Archive -Path dist\AquaAudit -DestinationPath installer_out\AquaAudit-Portable-${{ steps.ver.outputs.version }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AquaAudit-Windows
+          path: |
+            installer_out/AquaAudit-Setup-*.exe
+            installer_out/AquaAudit-Portable-*.zip
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer_out/AquaAudit-Setup-*.exe
+            installer_out/AquaAudit-Portable-*.zip
