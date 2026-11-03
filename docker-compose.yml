@@ -1,0 +1,14 @@
+services:
+  aquaaudit:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      AQUA_DEMO: "0"                       # 1 = ساخت مجتمع نمونه فرضی
+      AQUA_ADMIN_PASSWORD: "${AQUA_ADMIN_PASSWORD:?گذرواژه مدیر را تنظیم کنید}"
+      AQUA_SECRET: "${AQUA_SECRET:?کلید امضای نشست را تنظیم کنید}"
+    volumes:
+      - aqua_data:/data
+    restart: unless-stopped
+volumes:
+  aqua_data:

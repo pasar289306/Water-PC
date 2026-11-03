@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AquaAudit – ممیزی و مدیریت آب صنعتی</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card login-card">
+    <h1>AquaAudit</h1>
+    <p class="muted">پلتفرم ممیزی و مدیریت آب صنایع</p>
+    <label>نام کاربری<input name="username" autocomplete="username" required></label>
+    <label>گذرواژه<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="btn primary" type="submit">ورود</button>
+    <div id="loginErr" class="err"></div>
+  </form>
+</div>
+
+<div id="app" class="app hidden">
+  <aside class="side">
+    <div class="brand">AquaAudit</div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <div id="whoami" class="muted small"></div>
+      <button class="btn small" id="logoutBtn">خروج</button>
+    </div>
+  </aside>
+  <main>
+    <header class="top">
+      <label class="inline">مجتمع:
+        <select id="siteSel"></select>
+      </label>
+      <label class="inline">دوره:
+        <input id="periodInp" placeholder="همه (یا 2025 / 2025-03)" size="18">
+      </label>
+      <button class="btn small" id="refreshBtn">بروزرسانی</button>
+    </header>
+    <div id="toast" class="toast hidden"></div>
+    <section id="view"></section>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

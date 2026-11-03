@@ -1,0 +1,6 @@
+starlette>=1.0
+uvicorn>=0.30
+pydantic>=2.5
+numpy>=2.0
+PyJWT>=2.8
+python-multipart>=0.0.9
