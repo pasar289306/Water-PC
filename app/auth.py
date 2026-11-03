@@ -24,12 +24,12 @@ def _secret() -> str:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     p = DATA_DIR / "secret.key"
     if not p.exists():
-        p.write_text(secrets.token_hex(32))
+        p.write_text(secrets.token_hex(32), encoding="utf-8")
         try:
             p.chmod(0o600)
         except OSError:
             pass
-    return p.read_text().strip()
+    return p.read_text(encoding="utf-8").strip()
 
 
 def hash_password(pw: str, salt: bytes | None = None) -> str:

@@ -99,6 +99,12 @@ def _main(argv: list[str]) -> int:
     _LOG_PATHS.append(d / "desktop.log")
     if os.environ.get("AQUA_SMOKE_LOG"):
         _LOG_PATHS.append(Path(os.environ["AQUA_SMOKE_LOG"]))
+    import logging
+    for lp in _LOG_PATHS:  # لاگ uvicorn/برنامه (از جمله خطای startup) هم در فایل ثبت شود
+        h = logging.FileHandler(lp, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(h)
+    logging.getLogger().setLevel(logging.INFO)
     log(f"شروع؛ frozen={getattr(sys, 'frozen', False)} python={sys.version.split()[0]} data={d}")
     os.environ.setdefault("AQUA_DATA_DIR", str(d))
     os.environ.setdefault("AQUA_DEMO", "1")  # مجتمع نمونه فرضی برای ارزیابی اولیه؛ با AQUA_DEMO=0 غیرفعال می‌شود

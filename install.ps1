@@ -1,4 +1,4 @@
-# نصب AquaAudit روی ویندوز (PowerShell)
+﻿# نصب AquaAudit روی ویندوز (PowerShell)
 # استفاده:  powershell -ExecutionPolicy Bypass -File install.ps1 [-Run] [-NoDemo]
 param([switch]$Run, [switch]$NoDemo)
 $ErrorActionPreference = "Stop"

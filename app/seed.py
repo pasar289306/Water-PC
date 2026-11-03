@@ -170,12 +170,15 @@ def seed_admin():
     if generated:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         f = DATA_DIR / "INITIAL_ADMIN_PASSWORD.txt"
-        f.write_text(f"username: admin\npassword: {pw}\n(پس از ورود، گذرواژه را تغییر دهید و این فایل را حذف کنید)\n")
+        f.write_text(f"username: admin\npassword: {pw}\n(پس از ورود، گذرواژه را تغییر دهید و این فایل را حذف کنید)\n", encoding="utf-8")
         try:
             f.chmod(0o600)
         except OSError:
             pass
-        print(f"\n[AquaAudit] کاربر مدیر ساخته شد. گذرواژه اولیه در {f} ذخیره شد.\n")
+        try:  # کنسول ویندوز/برنامه بدون کنسول ممکن است فارسی را نتواند چاپ کند؛ این نباید startup را بیندازد
+            print(f"\n[AquaAudit] Admin user created. Initial password saved in: {f}\n")
+        except Exception:
+            pass
 
 
 def seed_demo():
