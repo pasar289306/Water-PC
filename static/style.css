@@ -51,3 +51,7 @@ td.num{direction:ltr;text-align:left}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:.2rem .8rem;font-size:.9rem}
 .kv b{color:var(--muted);font-weight:500}
 @media(max-width:800px){.app{grid-template-columns:1fr}.side{position:static;height:auto}#nav{flex-direction:row;flex-wrap:wrap}.bar-row{grid-template-columns:100px 1fr 70px}}
+details.card>summary{cursor:pointer;list-style:revert}details.card[open]>summary{margin-bottom:.2rem}
+select[multiple]{min-height:4.5rem}
+.bar-row.wide{grid-template-columns:150px 1fr 170px;margin:.5rem 0}
+@media(max-width:800px){.bar-row.wide{grid-template-columns:100px 1fr 130px}}

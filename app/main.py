@@ -30,7 +30,8 @@ MAX_UPLOAD = 5 * 1024 * 1024
 
 KINDS_IN = {"raw", "potable", "fresh", "rain", "reclaimed_in"}
 KINDS_OUT = {"wastewater", "blowdown", "evaporation", "product", "leakage", "other_out"}
-KINDS_INTERNAL = {"reclaimed", "recycled", "condensate"}
+# جریان‌های داخلی: بازچرخانی/استفاده مجدد (reclaimed, recycled, condensate) + جریان‌های حسابداری سطح سیستم
+KINDS_INTERNAL = {"reclaimed", "recycled", "condensate", "process", "cooling", "bfw", "permeate", "concentrate"}
 QUALITIES = {"valid", "estimated", "suspect", "invalid", "missing"}
 
 
@@ -50,6 +51,7 @@ class UserIn(BaseModel):
 class SiteIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     industry_code: str = "IND-15"
+    subgroup_code: str = ""
     location: str = ""
     product_unit: str = "تن"
     cost_supply: float = Field(0, ge=0)
@@ -67,19 +69,75 @@ class UnitIn(BaseModel):
 
 class EquipmentIn(BaseModel):
     name: str = Field(min_length=1)
-    kind: Literal["cooling_tower", "boiler", "ro", "pump", "wwtp", "other"]
+    kind: str = Field(min_length=1)          # کد از equipment_types (کاتالوگ)
     unit_id: int | None = None
     params: dict = {}
 
 
+class EquipmentTypeIn(BaseModel):
+    code: str = Field(pattern=r"^[A-Za-z0-9_\-]{2,40}$")
+    name_fa: str = Field(min_length=1)
+    name_en: str = ""
+    system_code: str = ""
+
+
 class StreamIn(BaseModel):
     name: str = Field(min_length=1)
-    direction: Literal["in", "out"]
-    kind: str
-    scope: Literal["external", "internal"] = "external"
+    # اگر stream_type داده شود، جهت/محدوده/نوع از تعریف آن (کاتالوگ) پر می‌شود؛ مقدار صریح، آن را بازنویسی می‌کند
+    stream_type: str = ""
+    direction: Literal["in", "out"] | None = None
+    kind: str | None = None
+    scope: Literal["external", "internal"] | None = None
+    system_code: str = ""
+    source_category: str = ""
+    origin: str = ""
+    destination: str = ""
+    quality_class: str = ""
+    allowed_use: str = ""
+    recycle_status: str = ""
     unit_id: int | None = None
     meter_id: str = ""
     uncertainty_pct: float = Field(2.0, ge=0, le=100)
+
+
+class IndustryIn(BaseModel):
+    code: str = Field(pattern=r"^[A-Za-z0-9_\-]{2,30}$")
+    name: str = Field(min_length=1)
+    examples: str = ""
+    subgroups: list[list[str]] = []
+    typical_systems: list[str] = []
+    processes: list[str] = []
+    highlights: str = ""
+    measure_codes: list[str] = []
+
+
+class SystemIn(BaseModel):
+    code: str = Field(pattern=r"^[A-Za-z0-9_\-]{2,30}$")
+    name_fa: str = Field(min_length=1)
+    name_en: str = ""
+    category: str = ""
+    equipment: list[str] = []
+    typical_in: list[str] = []
+    typical_out: list[str] = []
+    measurements: list[str] = []
+    calc_module: str | None = None
+    kpis: list[str] = []
+    notes: str = ""
+
+
+class StreamTypeIn(BaseModel):
+    code: str = Field(pattern=r"^[A-Za-z0-9_\-]{2,30}$")
+    name_fa: str = Field(min_length=1)
+    name_en: str = ""
+    direction: Literal["in", "out"]
+    scope: Literal["external", "internal"]
+    kind: str
+    definition: str = ""
+    quality_class: str = ""
+    allowed_use: str = ""
+    origin: str = ""
+    destination: str = ""
+    recycle_status: str = ""
 
 
 class ReadingIn(BaseModel):
@@ -258,6 +316,14 @@ async def change_password(request: Request):
 
 
 # ---------------------------------------------------------------- مجتمع‌ها
+def check_industry(c, industry_code: str, subgroup_code: str = ""):
+    ind = one(c.execute("SELECT subgroups FROM industries WHERE code=?", (industry_code,)))
+    if not ind:
+        raise HTTPException(422, f"گروه صنعتی «{industry_code}» در کاتالوگ تعریف نشده است")
+    if subgroup_code and subgroup_code not in {s[0] for s in json.loads(ind["subgroups"] or "[]")}:
+        raise HTTPException(422, f"زیرگروه «{subgroup_code}» متعلق به {industry_code} نیست")
+
+
 def list_sites(request: Request):
     auth.require(request)
     with db() as c:
@@ -268,10 +334,12 @@ async def create_site(request: Request):
     u = auth.require(request, "engineer")
     d = parse(SiteIn, await body(request))
     with db() as c:
-        cur = c.execute("""INSERT INTO sites(name,industry_code,location,product_unit,cost_supply,cost_pumping,
-            cost_treatment,cost_distribution,cost_disposal,screening_pct,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                        (d.name, d.industry_code, d.location, d.product_unit, d.cost_supply, d.cost_pumping,
-                         d.cost_treatment, d.cost_distribution, d.cost_disposal, d.screening_pct, u["id"]))
+        check_industry(c, d.industry_code, d.subgroup_code)
+        cur = c.execute("""INSERT INTO sites(name,industry_code,subgroup_code,location,product_unit,cost_supply,cost_pumping,
+            cost_treatment,cost_distribution,cost_disposal,screening_pct,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (d.name, d.industry_code, d.subgroup_code, d.location, d.product_unit, d.cost_supply,
+                         d.cost_pumping, d.cost_treatment, d.cost_distribution, d.cost_disposal, d.screening_pct,
+                         u["id"]))
     auth.log(u, "create", "site", cur.lastrowid, d.name)
     return ok({"id": cur.lastrowid}, 201)
 
@@ -295,10 +363,11 @@ async def update_site(request: Request):
     get_site(site_id)
     d = parse(SiteIn, await body(request))
     with db() as c:
-        c.execute("""UPDATE sites SET name=?,industry_code=?,location=?,product_unit=?,cost_supply=?,cost_pumping=?,
-            cost_treatment=?,cost_distribution=?,cost_disposal=?,screening_pct=? WHERE id=?""",
-                  (d.name, d.industry_code, d.location, d.product_unit, d.cost_supply, d.cost_pumping,
-                   d.cost_treatment, d.cost_distribution, d.cost_disposal, d.screening_pct, site_id))
+        check_industry(c, d.industry_code, d.subgroup_code)
+        c.execute("""UPDATE sites SET name=?,industry_code=?,subgroup_code=?,location=?,product_unit=?,cost_supply=?,
+            cost_pumping=?,cost_treatment=?,cost_distribution=?,cost_disposal=?,screening_pct=? WHERE id=?""",
+                  (d.name, d.industry_code, d.subgroup_code, d.location, d.product_unit, d.cost_supply,
+                   d.cost_pumping, d.cost_treatment, d.cost_distribution, d.cost_disposal, d.screening_pct, site_id))
     auth.log(u, "update", "site", site_id)
     return ok({"ok": True})
 
@@ -330,6 +399,8 @@ async def add_equipment(request: Request):
     get_site(site_id)
     d = parse(EquipmentIn, await body(request))
     with db() as c:
+        if not one(c.execute("SELECT 1 x FROM equipment_types WHERE code=?", (d.kind,))):
+            raise HTTPException(422, f"نوع تجهیز «{d.kind}» در کاتالوگ تعریف نشده است")
         cur = c.execute("INSERT INTO equipment(site_id,unit_id,name,kind,params) VALUES(?,?,?,?,?)",
                         (site_id, d.unit_id, d.name, d.kind, json.dumps(d.params, ensure_ascii=False)))
     auth.log(u, "create", "equipment", cur.lastrowid, d.name)
@@ -349,18 +420,42 @@ async def add_stream(request: Request):
     site_id = sid(request)
     get_site(site_id)
     d = parse(StreamIn, await body(request))
-    valid = KINDS_INTERNAL if d.scope == "internal" else (KINDS_IN if d.direction == "in" else KINDS_OUT)
-    if d.scope == "internal" and d.kind not in KINDS_INTERNAL:
-        raise HTTPException(422, f"نوع جریان داخلی باید یکی از {sorted(KINDS_INTERNAL)} باشد")
-    if d.scope == "external" and d.kind not in valid:
-        raise HTTPException(422, f"نوع جریان {('ورودی' if d.direction == 'in' else 'خروجی')} باید یکی از {sorted(valid)} باشد")
-    try:
-        with db() as c:
-            cur = c.execute("""INSERT INTO streams(site_id,unit_id,name,direction,kind,scope,meter_id,uncertainty_pct)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (site_id, d.unit_id, d.name, d.direction, d.kind, d.scope, d.meter_id, d.uncertainty_pct))
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, "جریانی با این نام در این مجتمع وجود دارد")
+    with db() as c:
+        t = None
+        if d.stream_type:
+            t = one(c.execute("SELECT * FROM stream_types WHERE code=?", (d.stream_type,)))
+            if not t:
+                raise HTTPException(422, f"نوع جریان «{d.stream_type}» در کاتالوگ تعریف نشده است")
+        direction = d.direction or (t["direction"] if t else None)
+        kind = d.kind or (t["kind"] if t else None)
+        scope = d.scope or (t["scope"] if t else "external")
+        if not direction or not kind:
+            raise HTTPException(422, "نوع جریان (stream_type) یا جهت و نوع (direction/kind) را مشخص کنید")
+        if scope == "internal":
+            if kind not in KINDS_INTERNAL:
+                raise HTTPException(422, f"نوع جریان داخلی باید یکی از {sorted(KINDS_INTERNAL)} باشد")
+        else:
+            valid = KINDS_IN if direction == "in" else KINDS_OUT
+            if kind not in valid:
+                raise HTTPException(422, f"نوع جریان {('ورودی' if direction == 'in' else 'خروجی')} باید یکی از {sorted(valid)} باشد")
+        if d.system_code and not one(c.execute("SELECT 1 x FROM systems WHERE code=?", (d.system_code,))):
+            raise HTTPException(422, f"سیستم «{d.system_code}» در کاتالوگ تعریف نشده است")
+        if d.source_category and not one(c.execute("SELECT 1 x FROM source_categories WHERE code=?", (d.source_category,))):
+            raise HTTPException(422, f"دسته منبع «{d.source_category}» تعریف نشده است")
+        if d.unit_id and not one(c.execute("SELECT 1 x FROM units WHERE id=? AND site_id=?", (d.unit_id, site_id))):
+            raise HTTPException(422, "واحد انتخاب‌شده متعلق به این مجتمع نیست")
+        # ویژگی‌های توصیفی؛ در صورت خالی بودن از تعریف نوع جریان پیش‌فرض می‌گیرند
+        pick = lambda v, k: v or (t[k] if t else "")
+        try:
+            cur = c.execute("""INSERT INTO streams(site_id,unit_id,name,direction,kind,scope,meter_id,uncertainty_pct,
+                stream_type,system_code,source_category,origin,destination,quality_class,allowed_use,recycle_status)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (site_id, d.unit_id, d.name, direction, kind, scope, d.meter_id, d.uncertainty_pct,
+                             d.stream_type, d.system_code, d.source_category, pick(d.origin, "origin"),
+                             pick(d.destination, "destination"), pick(d.quality_class, "quality_class"),
+                             pick(d.allowed_use, "allowed_use"), pick(d.recycle_status, "recycle_status")))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "جریانی با این نام در این مجتمع وجود دارد")
     auth.log(u, "create", "stream", cur.lastrowid, d.name)
     return ok({"id": cur.lastrowid}, 201)
 
@@ -608,6 +703,7 @@ async def baseline(request: Request):
 CALCS = {
     "cooling-tower": eq.cooling_tower, "coc-saving": eq.cooling_tower_coc_saving, "boiler": eq.boiler,
     "ro": eq.reverse_osmosis, "pump": eq.pump, "wwtp": eq.wastewater_plant,
+    "dm": eq.dm_plant, "distribution": eq.distribution, "sanitary": eq.sanitary, "irrigation": eq.irrigation,
 }
 
 
@@ -666,40 +762,194 @@ async def create_measure(request: Request):
 
 
 def recommend(request: Request):
-    """پیشنهاد راهکار بر پایه سیستم‌هایی که در مجتمع تجهیز دارند (قاعده‌محور، شفاف)."""
+    """پیشنهاد راهکار (قاعده‌محور و شفاف): بر پایه سیستم‌های موجود در مجتمع (تجهیز، واحد، جریان)،
+    صنعت مجتمع، فهرست «راهکارهای شاخص» همان صنعت در کاتالوگ، و شاخص‌های در سطح هشدار."""
     auth.require(request)
     site_id = sid(request)
     site = get_site(site_id)
     with db() as c:
         kinds = {e["kind"] for e in rows(c.execute("SELECT kind FROM equipment WHERE site_id=?", (site_id,)))}
         units = {u["system_code"] for u in rows(c.execute("SELECT system_code FROM units WHERE site_id=?", (site_id,)))}
+        stream_sys = {services.stream_system(t) for t in services.stream_totals(site_id)} - {""}
+        ind = one(c.execute("SELECT name, measure_codes FROM industries WHERE code=?", (site["industry_code"],)))
         ms = rows(c.execute("SELECT * FROM measures ORDER BY grp, code"))
-    sys_map = {"cooling_tower": "SYS-01", "boiler": "SYS-02", "ro": "SYS-03", "wwtp": "SYS-06", "pump": "SYS-08"}
-    present = {sys_map[k] for k in kinds if k in sys_map} | units
+    with db() as c:
+        sys_map = {r["code"]: r["system_code"] for r in rows(c.execute("SELECT code, system_code FROM equipment_types"))}
+    present = {sys_map[k] for k in kinds if sys_map.get(k)} | units | stream_sys
+    flagship = set(json.loads(ind["measure_codes"])) if ind else set()
     kp = {k["code"]: k for k in services.site_kpis(site_id)}
     out = []
     for m in ms:
         reasons = []
+        ind_match = m["industries"] not in ("ALL", "") and site["industry_code"] in m["industries"].split(",")
         if m["system_code"] and m["system_code"] in present:
             reasons.append(f"مجتمع سیستم {m['system_code']} دارد")
         elif not m["system_code"]:
             reasons.append("راهکار عمومی")
-        if m["industries"] not in ("ALL", "") and site["industry_code"] in m["industries"].split(","):
+        if ind_match:
             reasons.append("مرتبط با صنعت مجتمع")
+        if m["code"] in flagship:
+            reasons.append(f"راهکار شاخص صنعت «{ind['name']}» در کاتالوگ")
         if kp.get("LEAK", {}).get("level") in ("هشدار", "بحرانی") and "نشتی" in m["title"]:
             reasons.append("شاخص نشتی در سطح هشدار/بحرانی است")
         if kp.get("IMBAL", {}).get("level") in ("هشدار", "بحرانی") and m["system_code"] == "SYS-08":
             reasons.append("عدم تطابق موازنه بالاست")
-        if m["system_code"] and m["system_code"] not in present and not (m["industries"] not in ("ALL", "") and site["industry_code"] in m["industries"].split(",")):
+        if m["system_code"] and m["system_code"] not in present and not ind_match and m["code"] not in flagship:
             continue
-        out.append({**m, "reasons": reasons})
+        out.append({**m, "reasons": reasons, "flagship": m["code"] in flagship})
+    out.sort(key=lambda x: (not x["flagship"], x["grp"], x["code"]))
     return ok(out)
+
+
+# ---------------------------------------------------------------- کاتالوگ صنایع/سیستم‌ها/انواع جریان
+def _json_cols(r: dict, cols: list[str]) -> dict:
+    for k in cols:
+        try:
+            r[k] = json.loads(r[k] or "[]")
+        except (TypeError, ValueError):
+            r[k] = []
+    return r
+
+
+def get_catalog(request: Request):
+    auth.require(request)
+    from .catalog import SYSTEM_CATEGORIES, SOURCE_ATTRIBUTES, PARAMETERS_NOTE, INSTRUMENT_NOTE
+    with db() as c:
+        inds = [_json_cols(r, ["subgroups", "typical_systems", "processes", "measure_codes"])
+                for r in rows(c.execute("SELECT * FROM industries ORDER BY code"))]
+        syss = [_json_cols(r, ["equipment", "typical_in", "typical_out", "measurements", "kpis"])
+                for r in rows(c.execute("SELECT * FROM systems ORDER BY code"))]
+        sts = rows(c.execute("SELECT * FROM stream_types ORDER BY rowid"))
+        srcs = rows(c.execute("SELECT * FROM source_categories ORDER BY code"))
+        eqt = rows(c.execute("SELECT * FROM equipment_types ORDER BY system_code='' , system_code, rowid"))
+        prm = rows(c.execute("SELECT * FROM parameters ORDER BY rowid"))
+        ins = rows(c.execute("SELECT * FROM instruments ORDER BY rowid"))
+        fml = rows(c.execute("SELECT system_code, name, formula, source FROM system_formulas ORDER BY id"))
+        meas = {m["system_code"]: 0 for m in rows(c.execute("SELECT DISTINCT system_code FROM measures"))}
+        for r in rows(c.execute("SELECT system_code, COUNT(*) n FROM measures GROUP BY system_code")):
+            meas[r["system_code"]] = r["n"]
+    for sy in syss:
+        sy["measure_count"] = meas.get(sy["code"], 0)
+        sy["formulas"] = [f for f in fml if f["system_code"] == sy["code"]]
+        sy["equipment_count"] = sum(1 for e in eqt if e["system_code"] == sy["code"])
+    return ok({"industries": inds, "systems": syss, "stream_types": sts, "source_categories": srcs,
+               "system_categories": SYSTEM_CATEGORIES, "source_attributes": SOURCE_ATTRIBUTES,
+               "equipment_types": eqt, "parameters": prm, "instruments": ins,
+               "parameters_note": PARAMETERS_NOTE, "instrument_note": INSTRUMENT_NOTE})
+
+
+def _validate_refs(c, systems=(), measures=(), stream_types=()):
+    for code, table, label in ((systems, "systems", "سیستم"), (measures, "measures", "راهکار"),
+                               (stream_types, "stream_types", "نوع جریان")):
+        for x in code:
+            if not one(c.execute(f"SELECT 1 x FROM {table} WHERE code=?", (x,))):
+                raise HTTPException(422, f"{label} «{x}» در کاتالوگ تعریف نشده است")
+
+
+async def upsert_industry(request: Request):
+    u = auth.require(request, "engineer")
+    d = parse(IndustryIn, await body(request))
+    j = lambda x: json.dumps(x, ensure_ascii=False)
+    with db() as c:
+        _validate_refs(c, systems=d.typical_systems, measures=d.measure_codes)
+        c.execute("""INSERT INTO industries(code,name,examples,subgroups,typical_systems,processes,highlights,
+                     measure_codes,source) VALUES(?,?,?,?,?,?,?,?,'user') ON CONFLICT(code) DO UPDATE SET
+                     name=excluded.name, examples=excluded.examples, subgroups=excluded.subgroups,
+                     typical_systems=excluded.typical_systems, processes=excluded.processes,
+                     highlights=excluded.highlights, measure_codes=excluded.measure_codes, source='user'""",
+                  (d.code, d.name, d.examples, j(d.subgroups), j(d.typical_systems), j(d.processes), d.highlights,
+                   j(d.measure_codes)))
+    auth.log(u, "upsert", "industry", d.code)
+    return ok({"ok": True})
+
+
+async def upsert_system(request: Request):
+    u = auth.require(request, "engineer")
+    d = parse(SystemIn, await body(request))
+    j = lambda x: json.dumps(x, ensure_ascii=False)
+    with db() as c:
+        _validate_refs(c, stream_types=d.typical_in + d.typical_out)
+        c.execute("""INSERT INTO systems(code,name_fa,name_en,category,equipment,typical_in,typical_out,measurements,
+                     calc_module,kpis,notes,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,'user') ON CONFLICT(code) DO UPDATE SET
+                     name_fa=excluded.name_fa, name_en=excluded.name_en, category=excluded.category,
+                     equipment=excluded.equipment, typical_in=excluded.typical_in, typical_out=excluded.typical_out,
+                     measurements=excluded.measurements, calc_module=excluded.calc_module, kpis=excluded.kpis,
+                     notes=excluded.notes, source='user'""",
+                  (d.code, d.name_fa, d.name_en, d.category, j(d.equipment), j(d.typical_in), j(d.typical_out),
+                   j(d.measurements), d.calc_module, j(d.kpis), d.notes))
+    auth.log(u, "upsert", "system", d.code)
+    return ok({"ok": True})
+
+
+async def upsert_stream_type(request: Request):
+    u = auth.require(request, "engineer")
+    d = parse(StreamTypeIn, await body(request))
+    valid = KINDS_INTERNAL if d.scope == "internal" else (KINDS_IN if d.direction == "in" else KINDS_OUT)
+    if d.kind not in valid:
+        raise HTTPException(422, f"نوع (kind) برای این جهت/محدوده باید یکی از {sorted(valid)} باشد")
+    with db() as c:
+        c.execute("""INSERT INTO stream_types(code,name_en,name_fa,direction,scope,kind,definition,quality_class,
+                     allowed_use,origin,destination,recycle_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(code) DO UPDATE SET name_en=excluded.name_en, name_fa=excluded.name_fa,
+                     direction=excluded.direction, scope=excluded.scope, kind=excluded.kind,
+                     definition=excluded.definition, quality_class=excluded.quality_class,
+                     allowed_use=excluded.allowed_use, origin=excluded.origin, destination=excluded.destination,
+                     recycle_status=excluded.recycle_status""",
+                  (d.code, d.name_en, d.name_fa, d.direction, d.scope, d.kind, d.definition, d.quality_class,
+                   d.allowed_use, d.origin, d.destination, d.recycle_status))
+    auth.log(u, "upsert", "stream_type", d.code)
+    return ok({"ok": True})
+
+
+def apply_template(request: Request):
+    """ایجاد واحدهای پیش‌فرض (یک واحد برای هر سیستم نوعی صنعت) در مجتمع؛ واحدهای موجود دست‌نخورده می‌مانند."""
+    u = auth.require(request, "engineer")
+    site_id = sid(request)
+    site = get_site(site_id)
+    with db() as c:
+        ind = one(c.execute("SELECT * FROM industries WHERE code=?", (site["industry_code"],)))
+        if not ind:
+            raise HTTPException(422, "گروه صنعتی مجتمع در کاتالوگ نیست")
+        have = {r["system_code"] for r in c.execute("SELECT system_code FROM units WHERE site_id=?", (site_id,))}
+        created, skipped = [], []
+        for code in json.loads(ind["typical_systems"] or "[]"):
+            sy = one(c.execute("SELECT name_fa FROM systems WHERE code=?", (code,)))
+            if not sy:
+                continue
+            if code in have:
+                skipped.append(code)
+                continue
+            c.execute("INSERT INTO units(site_id,name,system_code) VALUES(?,?,?)", (site_id, sy["name_fa"], code))
+            created.append({"code": code, "name": sy["name_fa"]})
+    auth.log(u, "apply_template", "site", site_id, f"{ind['code']} created={len(created)}")
+    return ok({"industry": ind["code"], "created": created, "skipped": skipped})
+
+
+def system_accounting(request: Request):
+    auth.require(request)
+    site_id = sid(request)
+    get_site(site_id)
+    return ok(services.by_system(site_id, opt_period(request)))
 
 
 def list_kpi_defs(request: Request):
     auth.require(request)
     with db() as c:
         return ok(rows(c.execute("SELECT * FROM kpi_defs ORDER BY grp, code")))
+
+
+async def upsert_equipment_type(request: Request):
+    u = auth.require(request, "engineer")
+    d = parse(EquipmentTypeIn, await body(request))
+    with db() as c:
+        if d.system_code:
+            _validate_refs(c, systems=[d.system_code])
+        c.execute("""INSERT INTO equipment_types(code,name_fa,name_en,system_code,source) VALUES(?,?,?,?,'user')
+                     ON CONFLICT(code) DO UPDATE SET name_fa=excluded.name_fa, name_en=excluded.name_en,
+                     system_code=excluded.system_code, source='user'""",
+                  (d.code, d.name_fa, d.name_en, d.system_code))
+    auth.log(u, "upsert", "equipment_type", d.code)
+    return ok({"ok": True})
 
 
 async def upsert_kpi_def(request: Request):
@@ -834,6 +1084,13 @@ routes = [
     Route(S + "/anomalies", anomalies),
     Route(S + "/baseline", baseline, methods=["POST"]),
     Route(S + "/recommendations", recommend),
+    Route(S + "/apply-template", apply_template, methods=["POST"]),
+    Route(S + "/by-system", system_accounting),
+    Route("/api/catalog", get_catalog),
+    Route("/api/catalog/industries", upsert_industry, methods=["POST"]),
+    Route("/api/catalog/systems", upsert_system, methods=["POST"]),
+    Route("/api/catalog/stream-types", upsert_stream_type, methods=["POST"]),
+    Route("/api/catalog/equipment-types", upsert_equipment_type, methods=["POST"]),
     Route(S + "/projects", list_projects),
     Route(S + "/projects", add_project, methods=["POST"]),
     Route(S + "/projects/{project_id:int}", update_project, methods=["PUT"]),

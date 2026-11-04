@@ -11,6 +11,8 @@ import secrets
 from . import auth
 from .db import DATA_DIR, db, one
 from .engine.kpi import DEFAULT_KPIS
+from . import catalog
+import json
 
 GEN = "مبنای عمومی مهندسی؛ نیازمند راستی‌آزمایی در سایت"
 DOE = "US DOE FEMP – Cooling Tower Water Management"
@@ -142,6 +144,91 @@ MEASURE_COLS = ("code,title,grp,hierarchy,system_code,industries,problem,mechani
                 "quality_constraints,verification,source").split(",")
 
 
+# راهکارهای تکمیلی برای پوشش «راهکارهای شاخص هر صنعت» و سیستم‌های SYS-07/09/10/12 سند.
+# درصدها بازه‌های راهنما هستند و باید با داده سایت راستی‌آزمایی شوند.
+M += [
+    ("B-13", "بهینه‌سازی سیکل خنک‌کاری نیروگاه (COC و کنترل بلودان)", "B", "reduce", "SYS-01", "IND-01",
+     "مصرف بالای آب جبرانی سیکل خنک‌کاری", "کاهش بلودان و تلفات", "EC، آب جبرانی، بار حرارتی",
+     "مقایسه M قبل/بعد", 5, 25, "آب جبرانی سیستم خنک‌کاری", "کم تا متوسط", "۱ تا ۳ سال", 3, 3,
+     "رسوب، خوردگی، دمای مجاز کندانسور", "ثبت COC و آب جبرانی", "سند Methodology – راهکار شاخص نیروگاه"),
+    ("B-14", "اصلاح فرآیند تصفیه آب (DM/RO) و کاهش آب احیا و شست‌وشوی رزین", "B", "reduce", "SYS-07",
+     "IND-01,IND-02,IND-09", "پساب احیای رزین و بک‌واش زیاد", "احیای مبتنی بر ظرفیت واقعی و بازیافت آب شست‌وشو",
+     "حجم احیا، ظرفیت سیکل، هدایت خروجی", "S = ΔN_احیا × V_احیا", 10, 40, "آب مصرفی واحد DM",
+     "کم تا متوسط", "کمتر از ۲ سال", 2, 3, "کیفیت آب تغذیه بویلر", "کنتور فرعی واحد DM",
+     "سند Methodology – راهکار شاخص نیروگاه (اصلاح تصفیه آب)"),
+    ("D-06", "شست‌وشوی چندمرحله‌ای (Counter-current) و جداسازی جریان کم‌/پرآلودگی", "D", "reduce", "SYS-05",
+     "IND-06,IND-07,IND-10", "مصرف زیاد آب آبکشی", "استفاده مجدد آب مراحل پایانی در مراحل ابتدایی",
+     "دبی و کیفیت هر مرحله", "S = V_تک‌مرحله − V_چندمرحله", 20, 60, "آب شست‌وشوی همان خط", "متوسط",
+     "۱ تا ۳ سال", 2, 3, "الزامات بهداشتی/کیفی", "کنتور فرعی هر مرحله", "سند Methodology – صنایع غذایی/نساجی"),
+    ("C-10", "بازیافت آب CIP با کنترل کیفیت (هدایت/کدورت/میکروبی)", "C", "reuse", "SYS-05", "IND-06,IND-10",
+     "تخلیه آب آبکشی نهایی CIP", "برگشت آب آبکشی نهایی به مرحله پیش‌شست‌وشو",
+     "هدایت، کدورت، pH، دما", "S = V_آبکشی نهایی × سهم بازیافت", 20, 60, "آب CIP", "متوسط", "۱ تا ۳ سال", 3, 3,
+     "الزامات بهداشتی؛ کنترل آنلاین کیفیت ضروری", "ثبت حجم و کیفیت", "سند Methodology – صنایع غذایی"),
+    ("A-09", "کاهش آب شست‌وشو با حفظ الزامات GMP (بهینه‌سازی چرخه و تأیید پاکسازی)", "A", "reduce", "SYS-05",
+     "IND-10", "آب شست‌وشوی زیاد تجهیزات", "کاهش حجم/تعداد آبکشی پس از تأیید اعتبار پاکسازی",
+     "حجم آبکشی، نتایج اعتبارسنجی پاکسازی", "S = ΔV × N", 5, 30, "آب شست‌وشوی تجهیزات",
+     "کم تا متوسط", "کمتر از ۲ سال", 3, 3, "الزامات GMP و اعتبارسنجی پاکسازی", "ثبت چرخه‌ها",
+     "سند Methodology – داروسازی"),
+    ("A-10", "بازیافت کندانس تجهیزات تهویه (HVAC) برای آب جبرانی", "A", "reuse", "SYS-09", "ALL",
+     "تخلیه کندانس تهویه", "جایگزینی بخشی از آب جبرانی برج", "ظرفیت تهویه، رطوبت، دبی کندانس",
+     "S = V_کندانس_جمع‌آوری‌شده", 1, 10, "آب جبرانی برج خنک‌کن", "کم", "کمتر از ۳ سال", 1, 4,
+     "کنترل میکروبی (لژیونلا)", "کنتور", "سند Methodology – استفاده از کندانس سیستم تهویه"),
+    ("A-11", "نصب شیرآلات و فلاش‌تانک کم‌مصرف و رفع نشتی شیرآلات", "A", "reduce", "SYS-10", "ALL",
+     "مصرف و نشتی سرویس‌های بهداشتی", "کاهش دبی هر استفاده", "تعداد کارکنان، مصرف سرانه",
+     "S = N × ΔV_استفاده × روز", 15, 40, "آب بهداشتی", "کم", "کمتر از ۲ سال", 1, 5, "—",
+     "کنتور فرعی", GEN),
+    ("A-12", "مدیریت نشتی و تخلیه تست‌های شبکه آتش‌نشانی", "A", "reduce", "SYS-12", "ALL",
+     "نشتی شبکه و تخلیه تست‌ها", "جمع‌آوری آب تست و تعمیر نشتی", "سطح مخزن، فشار، برنامه تست",
+     "S = V_تست + V_نشتی", 0.1, 2, "کل آب مجتمع", "کم", "کمتر از ۲ سال", 1, 4,
+     "ذخیره ایمنی آتش‌نشانی نباید کاهش یابد", "کنتور فرعی/سطح مخزن", GEN),
+]
+
+
+def seed_catalog():
+    """بذر کاتالوگ: ردیف‌های کاربر (source='user') هرگز بازنویسی نمی‌شوند؛ ردیف‌های سند/راهنما با بروزرسانی نرم‌افزار تازه می‌شوند."""
+    j = lambda x: json.dumps(x, ensure_ascii=False)
+    with db() as c:
+        for code, name, ex, subs, systems, procs, hl, mcodes in catalog.INDUSTRIES:
+            c.execute("""INSERT INTO industries(code,name,examples,subgroups,typical_systems,processes,
+                         highlights,measure_codes,source) VALUES(?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(code) DO UPDATE SET name=excluded.name, examples=excluded.examples,
+                         subgroups=excluded.subgroups, typical_systems=excluded.typical_systems,
+                         processes=excluded.processes, highlights=excluded.highlights,
+                         measure_codes=excluded.measure_codes WHERE industries.source != 'user'""",
+                      (code, name, ex, j(subs), j(systems), j(procs), hl, j(mcodes), "doc+guide"))
+        for t in catalog.SYSTEMS:
+            assert len(t) == 12, t[0]
+            code, fa, en, cat, equip, tin, tout, meas, calc, kpis, notes, src = t
+            c.execute("""INSERT INTO systems(code,name_fa,name_en,category,equipment,typical_in,typical_out,
+                         measurements,calc_module,kpis,notes,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(code) DO UPDATE SET name_fa=excluded.name_fa, name_en=excluded.name_en,
+                         category=excluded.category, equipment=excluded.equipment, typical_in=excluded.typical_in,
+                         typical_out=excluded.typical_out, measurements=excluded.measurements,
+                         calc_module=excluded.calc_module, kpis=excluded.kpis, notes=excluded.notes,
+                         source=excluded.source WHERE systems.source != 'user'""",
+                      (code, fa, en, cat, j(equip), j(tin), j(tout), j(meas), calc, j(kpis), notes, src))
+        for t in catalog.STREAM_TYPES:
+            assert len(t) == 12, t[0]
+            c.execute("""INSERT OR IGNORE INTO stream_types(code,name_en,name_fa,direction,scope,kind,definition,
+                         quality_class,allowed_use,origin,destination,recycle_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", t)
+        for t in catalog.SOURCE_CATEGORIES:
+            c.execute("INSERT OR IGNORE INTO source_categories(code,name,examples,source) VALUES(?,?,?,?)", t)
+        for code, fa, en, sysc, src in catalog.EQUIPMENT_TYPES:
+            c.execute("""INSERT INTO equipment_types(code,name_fa,name_en,system_code,source) VALUES(?,?,?,?,?)
+                         ON CONFLICT(code) DO UPDATE SET name_fa=excluded.name_fa, name_en=excluded.name_en,
+                         system_code=excluded.system_code, source=excluded.source WHERE equipment_types.source != 'user'""",
+                      (code, fa, en, sysc, src))
+        for t in catalog.PARAMETERS:
+            c.execute("INSERT OR IGNORE INTO parameters(code,name,symbol,unit,grp,note,source) VALUES(?,?,?,?,?,?,'doc')", t)
+        for t in catalog.INSTRUMENTS:
+            c.execute("INSERT OR IGNORE INTO instruments(code,name_fa,name_en,usage,source) VALUES(?,?,?,?,'doc')", t)
+        for sysc, fs in catalog.SYSTEM_FORMULAS.items():
+            for name, formula in fs:
+                c.execute("""INSERT INTO system_formulas(system_code,name,formula,source) VALUES(?,?,?,'doc')
+                             ON CONFLICT(system_code,name) DO UPDATE SET formula=excluded.formula
+                             WHERE system_formulas.source != 'user'""", (sysc, name, formula))
+
+
 def seed_kpis():
     with db() as c:
         for code, name, formula, unit, grp, warn, crit in DEFAULT_KPIS:
@@ -193,6 +280,9 @@ def seed_demo():
         u1 = c.execute("INSERT INTO units(site_id,name,system_code) VALUES(?,?,?)", (sid, "سیستم خنک‌کاری", "SYS-01")).lastrowid
         c.execute("INSERT INTO units(site_id,name,system_code) VALUES(?,?,?)", (sid, "بخار و بویلر", "SYS-02"))
         c.execute("INSERT INTO units(site_id,name,system_code) VALUES(?,?,?)", (sid, "تصفیه فاضلاب", "SYS-06"))
+        c.execute("INSERT INTO units(site_id,name,system_code) VALUES(?,?,?)", (sid, "توزیع و مخازن", "SYS-08"))
+        c.execute("INSERT INTO units(site_id,name,system_code) VALUES(?,?,?)", (sid, "خط تولید", "SYS-04"))
+        c.execute("UPDATE sites SET subgroup_code='IND-03-A' WHERE id=?", (sid,))
         import json
         c.execute("INSERT INTO equipment(site_id,unit_id,name,kind,params) VALUES(?,?,?,?,?)",
                   (sid, u1, "برج خنک‌کن شماره ۱", "cooling_tower",
@@ -200,18 +290,18 @@ def seed_demo():
         c.execute("INSERT INTO equipment(site_id,name,kind,params) VALUES(?,?,?,?)",
                   (sid, "بویلر اصلی", "boiler", json.dumps({"steam_t_h": 80, "condensate_return_t_h": 45})))
 
-        def mk(name, d, kind, scope="external", unc=2.0):
-            return c.execute("INSERT INTO streams(site_id,name,direction,kind,scope,uncertainty_pct) VALUES(?,?,?,?,?,?)",
-                             (sid, name, d, kind, scope, unc)).lastrowid
-        well = mk("چاه‌های تأمین", "in", "raw", unc=2)
-        city = mk("آب شهری", "in", "potable", unc=1.5)
-        rain = mk("آب باران", "in", "rain", unc=10)
-        ww = mk("پساب خروجی", "out", "wastewater", unc=3)
-        bd = mk("بلودان برج", "out", "blowdown", unc=5)
-        ev = mk("تبخیر برج", "out", "evaporation", unc=10)
-        pr = mk("آب همراه محصول", "out", "product", unc=5)
-        lk = mk("نشتی تخمینی", "out", "leakage", unc=30)
-        rc = mk("پساب بازچرخانی داخلی", "in", "reclaimed", scope="internal", unc=3)
+        def mk(name, d, kind, scope="external", unc=2.0, stype="", system=""):
+            return c.execute("""INSERT INTO streams(site_id,name,direction,kind,scope,uncertainty_pct,stream_type,system_code)
+                                VALUES(?,?,?,?,?,?,?,?)""", (sid, name, d, kind, scope, unc, stype, system)).lastrowid
+        well = mk("چاه‌های تأمین", "in", "raw", unc=2, stype="RAW", system="SYS-08")
+        city = mk("آب شهری", "in", "potable", unc=1.5, stype="POTABLE", system="SYS-08")
+        rain = mk("آب باران", "in", "rain", unc=10, stype="RAIN", system="SYS-08")
+        ww = mk("پساب خروجی", "out", "wastewater", unc=3, stype="WASTEWATER", system="SYS-06")
+        bd = mk("بلودان برج", "out", "blowdown", unc=5, stype="BLOWDOWN", system="SYS-01")
+        ev = mk("تبخیر برج", "out", "evaporation", unc=10, stype="EVAPORATION", system="SYS-01")
+        pr = mk("آب همراه محصول", "out", "product", unc=5, stype="PRODUCT", system="SYS-04")
+        lk = mk("نشتی تخمینی", "out", "leakage", unc=30, stype="LEAKAGE", system="SYS-08")
+        rc = mk("پساب بازچرخانی داخلی", "in", "recycled", scope="internal", unc=3, stype="RECYCLED", system="SYS-01")
 
         rnd = random.Random(42)
         for m in range(1, 13):
@@ -244,6 +334,7 @@ def seed_demo():
 
 
 def seed_all():
+    seed_catalog()
     seed_kpis()
     seed_measures()
     seed_admin()
