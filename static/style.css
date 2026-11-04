@@ -55,3 +55,7 @@ details.card>summary{cursor:pointer;list-style:revert}details.card[open]>summary
 select[multiple]{min-height:4.5rem}
 .bar-row.wide{grid-template-columns:150px 1fr 170px;margin:.5rem 0}
 @media(max-width:800px){.bar-row.wide{grid-template-columns:100px 1fr 130px}}
+.subtabs{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:1rem}
+.sk-t{fill:var(--ink);font-size:12px}.sk-v{fill:var(--muted);font-size:11px}
+.sk-wrap{overflow:auto}
+.sk-wrap svg{min-width:640px;width:100%;height:auto;direction:ltr}

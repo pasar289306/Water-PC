@@ -224,13 +224,17 @@ MIGRATIONS = [
     ("streams", "quality_class", "TEXT DEFAULT ''"),
     ("streams", "allowed_use", "TEXT DEFAULT ''"),
     ("streams", "recycle_status", "TEXT DEFAULT ''"),
+    ("projects", "escalation", "REAL NOT NULL DEFAULT 0"),        # رشد سالانه هزینه آب (منفعت)
+    ("projects", "opex_escalation", "REAL NOT NULL DEFAULT 0"),   # رشد سالانه هزینه بهره‌برداری
+    ("projects", "salvage_value", "REAL NOT NULL DEFAULT 0"),
+    ("projects", "selected", "INTEGER NOT NULL DEFAULT 0"),       # عضویت در مجموعه راهکارهای منتخب
 ]
 
 
 def migrate(c: sqlite3.Connection):
     for table, col, decl in MIGRATIONS:
         cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
-        if col not in cols:
+        if cols and col not in cols:  # جدولی که هنوز نیست توسط SCHEMA ساخته می‌شود
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 

@@ -133,6 +133,8 @@ def test_migration_upgrades_old_database_without_losing_data(tmp_path):
     c.row_factory = sqlite3.Row
     c.executescript("""CREATE TABLE sites(id INTEGER PRIMARY KEY, name TEXT, industry_code TEXT);
                        CREATE TABLE streams(id INTEGER PRIMARY KEY, site_id INT, name TEXT, direction TEXT, kind TEXT, scope TEXT);
+                       CREATE TABLE projects(id INTEGER PRIMARY KEY, site_id INT, title TEXT, saving_m3_year REAL);
+                       INSERT INTO projects VALUES(1,1,'پروژه قدیمی',100);
                        INSERT INTO sites VALUES(1,'قدیمی','IND-03'); INSERT INTO streams VALUES(1,1,'چاه','in','raw','external');""")
     migrate(c)
     migrate(c)  # دوباره اجرا بی‌خطر است
@@ -141,6 +143,9 @@ def test_migration_upgrades_old_database_without_losing_data(tmp_path):
             "allowed_use", "recycle_status"} <= cols
     assert "subgroup_code" in {r["name"] for r in c.execute("PRAGMA table_info(sites)")}
     assert c.execute("SELECT name FROM streams WHERE id=1").fetchone()["name"] == "چاه"
+    pc = {r["name"] for r in c.execute("PRAGMA table_info(projects)")}
+    assert {"escalation", "opex_escalation", "salvage_value", "selected"} <= pc
+    assert c.execute("SELECT selected, escalation FROM projects WHERE id=1").fetchone()[:] == (0, 0)
 
 
 # ------------------------------------------------------------- بانک تجهیزات/پارامترها/فرمول‌ها

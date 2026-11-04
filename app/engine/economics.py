@@ -17,7 +17,7 @@ def npv(rate: float, capex: float, cash_flows: list[float]) -> float:
 def irr(capex: float, cash_flows: list[float]) -> float | None:
     """IRR با روش دوبخشی (بدون وابستگی)."""
     f = lambda r: npv(r, capex, cash_flows)
-    lo, hi = -0.99, 10.0
+    lo, hi = -0.99, 1000.0  # تا ۱۰۰٬۰۰۰٪؛ بازگشت‌های بسیار سریع هم IRR دارند
     if f(lo) * f(hi) > 0:
         return None
     for _ in range(200):
@@ -29,18 +29,102 @@ def irr(capex: float, cash_flows: list[float]) -> float | None:
     return (lo + hi) / 2
 
 
+def discounted_payback(capex: float, flows: list[float], rate: float) -> float | None:
+    """زمان بازگشت تنزیل‌یافته (سال، با درون‌یابی خطی در سال بازگشت)؛ اگر در عمر پروژه برنگردد None."""
+    if capex <= 0:
+        return 0.0
+    cum = 0.0
+    for t, cf in enumerate(flows):
+        pv = cf / (1 + rate) ** (t + 1)
+        if cum + pv >= capex and pv > 0:
+            return t + (capex - cum) / pv
+        cum += pv
+    return None
+
+
 def measure_economics(saving_m3_year: float, marginal_cost_m3: float, capex: float,
                       opex_year: float = 0.0, life_years: int = 10,
-                      discount_rate: float = 0.15, escalation: float = 0.0) -> dict:
+                      discount_rate: float = 0.15, escalation: float = 0.0,
+                      opex_escalation: float = 0.0, salvage_value: float = 0.0) -> dict:
+    """ارزیابی اقتصادی یک راهکار صرفه‌جویی.
+    - منفعت سال t = صرفه‌جویی آب × هزینه نهایی هر m³ × (1+escalation)^(t-1)   (t = 1..life)
+    - هزینه بهره‌برداری سال t = opex × (1+opex_escalation)^(t-1)
+    - سرمایه‌گذاری CAPEX در زمان صفر؛ ارزش اسقاط (اختیاری) در پایان عمر
+    خروجی: بازگشت ساده، بازگشت تنزیل‌یافته، NPV، IRR، نسبت منفعت به هزینه (BCR = PV منافع / (CAPEX + PV هزینه‌ها)) و جدول جریان نقدی."""
+    if life_years < 1:
+        raise ValueError("عمر پروژه باید حداقل ۱ سال باشد")
     gross = saving_m3_year * marginal_cost_m3
     net = gross - opex_year
-    flows = [net * (1 + escalation) ** t for t in range(life_years)]
+    rows_, flows = [], []
+    cum = -capex
+    cum_d = -capex
+    pv_ben = pv_opex = 0.0
+    for t in range(1, life_years + 1):
+        ben = gross * (1 + escalation) ** (t - 1)
+        opx = opex_year * (1 + opex_escalation) ** (t - 1)
+        extra = salvage_value if t == life_years else 0.0
+        n = ben - opx + extra
+        d = 1 / (1 + discount_rate) ** t
+        pv_ben += (ben + extra) * d
+        pv_opex += opx * d
+        cum += n
+        cum_d += n * d
+        flows.append(n)
+        rows_.append({"year": t, "benefit": ben, "opex": opx, "net": n, "discounted": n * d,
+                      "cumulative": cum, "cumulative_discounted": cum_d})
+    pv_costs = capex + pv_opex
+    sp = payback(capex, net)
     return {"annual_gross_saving": gross, "annual_net_saving": net,
-            "payback_years": payback(capex, net),
+            "simple_payback_years": sp, "payback_years": sp,
+            "discounted_payback_years": discounted_payback(capex, flows, discount_rate),
             "npv": npv(discount_rate, capex, flows),
             "irr": irr(capex, flows),
+            "bcr": (pv_ben / pv_costs) if pv_costs > 0 else None,
+            "pv_benefits": pv_ben, "pv_costs": pv_costs,
             "lcc_per_m3": ((capex + opex_year * life_years) / (saving_m3_year * life_years)
-                           if saving_m3_year > 0 else None)}
+                           if saving_m3_year > 0 else None),
+            "cash_flows": rows_}
+
+
+def portfolio_economics(items: list[dict]) -> dict:
+    """ارزیابی تجمیعی مجموعه‌ای از راهکارهای منتخب. هر آیتم: {capex, saving_m3_year, economics(با cash_flows)}.
+    NPV و PV منافع/هزینه‌ها جمع‌پذیرند؛ IRR و بازگشت‌ها از جریان نقدی تجمیعی (جمع سال‌به‌سال) محاسبه می‌شوند.
+    هشدار: جمع اثرات فقط برای راهکارهای مستقل از هم معتبر است."""
+    if not items:
+        return {"count": 0, "capex": 0.0, "saving_m3_year": 0.0, "annual_net_saving": 0.0, "npv": 0.0,
+                "simple_payback_years": None, "discounted_payback_years": None, "irr": None, "bcr": None,
+                "cash_flows": []}
+    capex = sum(i["capex"] for i in items)
+    horizon = max(len(i["economics"]["cash_flows"]) for i in items)
+    cf = []
+    cum = -capex
+    cum_d = -capex
+    for t in range(horizon):
+        net = sum(i["economics"]["cash_flows"][t]["net"] for i in items if t < len(i["economics"]["cash_flows"]))
+        dis = sum(i["economics"]["cash_flows"][t]["discounted"] for i in items if t < len(i["economics"]["cash_flows"]))
+        cum += net
+        cum_d += dis
+        cf.append({"year": t + 1, "net": net, "discounted": dis, "cumulative": cum, "cumulative_discounted": cum_d})
+    net_flows = [r["net"] for r in cf]
+    first_net = net_flows[0] if net_flows else 0.0
+    # بازگشت تنزیل‌یافته تجمیعی از روی جریان تنزیل‌شده
+    dpb = None
+    run = -capex
+    for r in cf:
+        if run + r["discounted"] >= 0 and r["discounted"] > 0:
+            dpb = r["year"] - 1 + (-run) / r["discounted"] if run < 0 else float(r["year"] - 1)
+            break
+        run += r["discounted"]
+    pv_b = sum(i["economics"]["pv_benefits"] for i in items)
+    pv_c = sum(i["economics"]["pv_costs"] for i in items)
+    return {"count": len(items), "capex": capex,
+            "saving_m3_year": sum(i["saving_m3_year"] for i in items),
+            "annual_net_saving": sum(i["economics"]["annual_net_saving"] for i in items),
+            "npv": sum(i["economics"]["npv"] for i in items),
+            "simple_payback_years": payback(capex, first_net) if capex > 0 else 0.0,
+            "discounted_payback_years": dpb if capex > 0 else 0.0,
+            "irr": irr(capex, net_flows), "bcr": (pv_b / pv_c) if pv_c > 0 else None,
+            "pv_benefits": pv_b, "pv_costs": pv_c, "cash_flows": cf}
 
 
 DEFAULT_WEIGHTS = {"saving": 0.25, "economics": 0.20, "ease": 0.15,

@@ -71,7 +71,7 @@ $("#logoutBtn").onclick = logout;
 
 // ---------- ناوبری ----------
 const PAGES = [
-  ["dashboard", "داشبورد"], ["structure", "ساختار و جریان‌ها"], ["catalog", "طبقه‌بندی صنایع و سیستم‌ها"],
+  ["dashboard", "داشبورد مجتمع صنعتی"], ["structure", "ساختار سیستم آب مجتمع"],
   ["data", "ورود داده"], ["balance", "موازنه و تحلیل"],
   ["calc", "محاسبه تجهیزات"], ["measures", "بانک راهکارها"], ["projects", "پروژه‌ها و اولویت‌بندی"],
   ["kpis", "تعریف شاخص‌ها"], ["report", "گزارش ممیزی"], ["admin", "مدیریت"],
@@ -101,7 +101,7 @@ async function loadSites(select) {
 const render = guard(async () => {
   renderNav(); const v = $("#view");
   if (!["admin", "measures", "calc", "catalog", "structure"].includes(state.page) && !state.siteId) {
-    v.innerHTML = html`<div class="card">ابتدا یک مجتمع صنعتی تعریف کنید (بخش «ساختار و جریان‌ها»).</div>`.__raw; return;
+    v.innerHTML = html`<div class="card">ابتدا یک مجتمع صنعتی تعریف کنید (بخش «ساختار سیستم آب مجتمع»).</div>`.__raw; return;
   }
   v.innerHTML = '<div class="card muted">در حال بارگذاری…</div>';
   await VIEWS[state.page](v);
@@ -127,11 +127,51 @@ function monthlyChart(series) {
   return html`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="نمودار ماهانه ورودی و خروجی آب">${{ __raw: g + bars }}</svg>
   <div class="legend"><span><i style="background:var(--pri)"></i>ورودی (m³)</span><span><i style="background:#d9822b"></i>خروجی ثبت‌شده (m³)</span></div>`;
 }
-function flowBars(sk) {
-  const all = [...sk.sources, ...sk.sinks]; const max = Math.max(...all.map(a => a.value), 1);
-  const row = (a, cls) => html`<div class="bar-row"><span>${a.name}</span><div><div class="bar ${cls}" style="width:${(a.value / max * 100).toFixed(1)}%"></div></div><span class="num">${fmt(a.value, 0)}</span></div>`;
-  return html`<h3>منابع</h3>${sk.sources.map(a => row(a, ""))}<h3>مصارف و تلفات</h3>${sk.sinks.map(a => row(a, "out"))}`;
+// نمودار سنکی (Sankey): منابع (راست) ← مجتمع ← مصارف/تلفات (چپ)؛ پهنای هر جریان متناسب با حجم آن
+const SK_SINK = { evaporation: "#d99a2b", wastewater: "#6f8196", blowdown: "#8b6fb0", product: "#2e9e6b", leakage: "#d9534f", unaccounted: "#c0392b", other_out: "#8a8f98" };
+const SK_SRC = ["#1d6fa5", "#2b8cc4", "#4aa3df", "#5b7fa6", "#3f9aa8", "#6b8fd1"];
+function sankeySvg(sk) {
+  const srcIn = sk.sources.filter(x => x.value > 0).slice().sort((a, b) => b.value - a.value);
+  const snkIn = sk.sinks.filter(x => x.value > 0).slice().sort((a, b) => b.value - a.value);
+  if (!srcIn.length && !snkIn.length) return html`<p class="muted">برای دوره انتخاب‌شده قرائت ثبت نشده است.</p>`;
+  const sIn = srcIn.reduce((a, x) => a + x.value, 0), sOut = snkIn.reduce((a, x) => a + x.value, 0);
+  const diff = sIn - sOut, tol = Math.max(sIn, sOut) * 0.005;
+  const srcs = srcIn.map((x, i) => ({ ...x, color: SK_SRC[i % SK_SRC.length] }));
+  const snks = snkIn.map(x => ({ ...x, color: SK_SINK[x.kind] || SK_SINK.other_out }));
+  if (diff > tol) snks.push({ name: "ثبت‌نشده/باقیمانده موازنه", value: diff, kind: "unaccounted", color: SK_SINK.unaccounted });
+  else if (diff < -tol) srcs.push({ name: "منبع ثبت‌نشده (مازاد خروجی)", value: -diff, color: SK_SINK.unaccounted });
+  const total = Math.max(srcs.reduce((a, x) => a + x.value, 0), snks.reduce((a, x) => a + x.value, 0));
+  const W = 960, LAB = 250, NW = 14, GAP = 10, H = Math.max(300, Math.max(srcs.length, snks.length) * 34);
+  const sc = (H - GAP * (Math.max(srcs.length, snks.length) - 1)) / total;
+  const hh = v => Math.max(v * sc, 2);
+  const xS = W - LAB - NW, xC = W / 2 - NW / 2, xK = LAB;
+  const colH = a => a.reduce((t, x) => t + hh(x.value), 0) + GAP * (a.length - 1);
+  const yC0 = (H - total * sc) / 2;
+  const link = (x1, y1, h1, x2, y2, h2, color, tip) => {
+    const xm = (x1 + x2) / 2;
+    return `<path d="M${x1},${y1} C${xm},${y1} ${xm},${y2} ${x2},${y2} L${x2},${y2 + h2} C${xm},${y2 + h2} ${xm},${y1 + h1} ${x1},${y1 + h1} Z" fill="${color}" fill-opacity=".38" stroke="none"><title>${esc(tip)}</title></path>`;
+  };
+  let out = "", y = (H - colH(srcs)) / 2, cum = 0;
+  for (const n of srcs) {
+    const h = hh(n.value), lh = n.value * sc, pct = n.value / total * 100;
+    out += link(xS, y, h, xC + NW, yC0 + cum * sc, lh, n.color, `${n.name}: ${fmt(n.value, 0)} m³ (${fmt(pct, 1)}٪)`);
+    out += `<rect x="${xS}" y="${y}" width="${NW}" height="${h}" fill="${n.color}"><title>${esc(n.name)}</title></rect>`;
+    out += `<text class="sk-t" x="${xS + NW + 6}" y="${y + h / 2 - 1}" text-anchor="start">${esc(clip(n.name, 26))}</text><text class="sk-v" x="${xS + NW + 6}" y="${y + h / 2 + 13}" text-anchor="start">${fmt(n.value, 0)} m³ · ${fmt(pct, 1)}٪</text>`;
+    y += h + GAP; cum += n.value;
+  }
+  y = (H - colH(snks)) / 2; cum = 0;
+  for (const n of snks) {
+    const h = hh(n.value), lh = n.value * sc, pct = n.value / total * 100;
+    out += link(xC, yC0 + cum * sc, lh, xK + NW, y, h, n.color, `${n.name}: ${fmt(n.value, 0)} m³ (${fmt(pct, 1)}٪)`);
+    out += `<rect x="${xK}" y="${y}" width="${NW}" height="${h}" fill="${n.color}"><title>${esc(n.name)}</title></rect>`;
+    out += `<text class="sk-t" x="${xK - 6}" y="${y + h / 2 - 1}" text-anchor="end">${esc(clip(n.name, 26))}</text><text class="sk-v" x="${xK - 6}" y="${y + h / 2 + 13}" text-anchor="end">${fmt(n.value, 0)} m³ · ${fmt(pct, 1)}٪</text>`;
+    y += h + GAP; cum += n.value;
+  }
+  out += `<rect x="${xC}" y="${yC0}" width="${NW}" height="${total * sc}" fill="var(--pri-d)"><title>مجتمع: ${fmt(total, 0)} m³</title></rect>`;
+  out += `<text class="sk-t" x="${W / 2}" y="${yC0 - 8}" text-anchor="middle" font-weight="700">مجتمع صنعتی (${fmt(total, 0)} m³)</text>`;
+  return { __raw: `<div class="sk-wrap"><svg viewBox="0 0 ${W} ${H + 30}" role="img" aria-label="نمودار سنکی جریان آب">${out}</svg></div>` };
 }
+const clip = (t, n) => t.length > n ? t.slice(0, n - 1) + "…" : t;
 const levelChip = l => ({ "عادی": "ok", "هشدار": "warn", "بحرانی": "bad" }[l] || "");
 
 // ---------- صفحات ----------
@@ -139,11 +179,13 @@ const VIEWS = {};
 
 VIEWS.dashboard = async v => {
   const id = state.siteId;
-  const [bal, kp, series, sk, bs] = await Promise.all([api(`/api/sites/${id}/balance${q()}`), api(`/api/sites/${id}/kpis${q()}`),
-    api(`/api/sites/${id}/series`), api(`/api/sites/${id}/sankey${q()}`), api(`/api/sites/${id}/by-system${q()}`)]);
+  const [bal, kp, series, sk, bs, pfSel, pfAll, integ] = await Promise.all([api(`/api/sites/${id}/balance${q()}`), api(`/api/sites/${id}/kpis${q()}`),
+    api(`/api/sites/${id}/series`), api(`/api/sites/${id}/sankey${q()}`), api(`/api/sites/${id}/by-system${q()}`),
+    api(`/api/sites/${id}/projects/portfolio?scope=selected`), api(`/api/sites/${id}/projects/portfolio?scope=all`),
+    api(`/api/sites/${id}/integrity`)]);
   const ep = bal.error_percent == null ? "—" : bal.error_percent.toFixed(2) + "٪";
   v.innerHTML = html`
-  <h2>داشبورد – ${site().name}</h2>
+  <h2>داشبورد مجتمع صنعتی – ${site().name}</h2>
   <div class="grid g4">
     <div class="kpi"><div class="n">ورودی کل (m³)</div><div class="v">${fmt(bal.total_in, 0)}</div></div>
     <div class="kpi"><div class="n">خروجی ثبت‌شده (m³)</div><div class="v">${fmt(bal.total_out, 0)}</div></div>
@@ -151,14 +193,53 @@ VIEWS.dashboard = async v => {
     <div class="kpi"><div class="n">Z = R/u<sub>R</sub></div><div class="v">${bal.z_score == null ? "—" : bal.z_score.toFixed(2)}</div></div>
   </div>
   <p class="note">${bal.status}${bal.warnings.length ? " – " + bal.warnings.length + " هشدار کیفیت داده" : ""}</p>
+  <div class="card"><h3>نمودار سنکی جریان آب ${period() ? "(دوره " + period() + ")" : "(مجموع دوره‌ها)"}</h3>${sankeySvg(sk)}
+   <p class="note small">فقط جریان‌های مرز مجتمع نمایش داده می‌شوند. اگر ورودی و خروجی برابر نباشد، تفاوت به‌صورت جریان قرمز «ثبت‌نشده/باقیمانده» دیده می‌شود.</p></div>
+  <div class="card"><h3>مصرف به تفکیک سیستم‌های مصرف‌کننده</h3>${systemBars(bs)}</div>
   <div class="card"><h3>روند ماهانه</h3>${monthlyChart(series)}</div>
-  <div class="card"><h3>شاخص‌های عملکرد</h3><div class="grid g3">${kp.map(k => html`
+  <div class="card"><h3>شاخص‌های مصرف و عملکرد (چکیده)</h3><div class="grid g3">${kp.map(k => html`
     <div class="kpi ${k.level === "هشدار" ? "warn" : k.level === "بحرانی" ? "crit" : ""}"><div class="n">${k.name}</div>
     <div class="v">${k.value == null ? "—" : fmt(k.value, 2)} <span class="small muted">${k.unit}</span></div>
     <span class="chip ${levelChip(k.level)}">${k.level}</span>${k.error ? html` <span class="small err">${k.error}</span>` : ""}</div>`)}</div></div>
-  <div class="card"><h3>نمودار جریان آب (m³)</h3>${flowBars(sk)}</div>
-  <div class="card"><h3>مصرف به تفکیک سیستم‌های مصرف‌کننده</h3>${systemBars(bs)}</div>`.__raw;
+  ${econSummary(pfSel, pfAll)}
+  ${integrityCard(integ)}`.__raw;
 };
+
+// چکیده کارایی اقتصادی راهکارهای صرفه‌جویی (منتخب‌ها؛ اگر انتخابی نشده باشد همه راهکارهای غیررد‌شده)
+function econSummary(sel, all) {
+  const pf = sel.count ? sel : all;
+  const scope = sel.count ? `مجموعه راهکارهای منتخب (${sel.count} از ${all.count})` : `همه راهکارهای پیشنهادی/در دست اقدام (${all.count}) – هنوز راهکار منتخبی علامت نخورده است`;
+  if (!pf.count) return html`<div class="card"><h3>کارایی اقتصادی راهکارهای صرفه‌جویی</h3>
+    <p class="muted">هنوز پروژه‌ای ثبت نشده است. از «بانک راهکارها» یک راهکار انتخاب و پروژه بسازید.</p>
+    <button class="btn small" data-act="goto" data-id="measures">بانک راهکارها</button></div>`;
+  const pb = v => v == null ? "—" : fmt(v, 2) + " سال";
+  const tile = (n, val, cls = "") => html`<div class="kpi ${cls}"><div class="n">${n}</div><div class="v">${val}</div></div>`;
+  const top = pf.projects.slice().sort((a, b) => b.npv - a.npv).slice(0, 5);
+  return html`<div class="card"><h3>کارایی اقتصادی راهکارهای صرفه‌جویی (چکیده)</h3><p class="note small">${scope}</p>
+   <div class="grid g4">
+    ${tile("صرفه‌جویی سالانه (m³)", fmt(pf.saving_m3_year, 0) + (pf.share_of_site_input_pct != null ? ` (${fmt(pf.share_of_site_input_pct, 1)}٪ ورودی)` : ""))}
+    ${tile("سرمایه‌گذاری کل", fmt(pf.capex, 0))}
+    ${tile("ارزش خالص فعلی (NPV)", fmt(pf.npv, 0), pf.npv < 0 ? "crit" : "")}
+    ${tile("نسبت منفعت به هزینه (BCR)", pf.bcr == null ? "—" : fmt(pf.bcr, 2), pf.bcr != null && pf.bcr < 1 ? "crit" : "")}
+    ${tile("بازگشت سرمایه ساده", pb(pf.simple_payback_years))}
+    ${tile("بازگشت سرمایه تنزیل‌یافته", pb(pf.discounted_payback_years))}
+    ${tile("نرخ بازده داخلی (IRR)", pf.irr == null ? "—" : fmt(pf.irr * 100, 1) + "٪")}
+    ${tile("صرفه‌جویی خالص سالانه (پول)", fmt(pf.annual_net_saving, 0))}</div>
+   <div class="tablewrap"><table><tr><th>برترین پروژه‌ها (بر اساس NPV)</th><th>صرفه‌جویی m³/سال</th><th>بازگشت ساده</th><th>تنزیل‌یافته</th><th>NPV</th><th>IRR</th><th>BCR</th></tr>
+    ${top.map(p => html`<tr><td>${p.title}</td><td class="num">${fmt(p.saving_m3_year, 0)}</td><td class="num">${fmt(p.simple_payback_years, 2)}</td><td class="num">${fmt(p.discounted_payback_years, 2)}</td>
+     <td class="num">${fmt(p.npv, 0)}</td><td class="num">${p.irr == null ? "—" : fmt(p.irr * 100, 1) + "٪"}</td><td class="num">${p.bcr == null ? "—" : fmt(p.bcr, 2)}</td></tr>`)}</table></div>
+   <p class="note small">جمع اثر راهکارها فقط در صورت استقلال فنی آن‌ها معتبر است. <button class="btn small" data-act="goto" data-id="projects">جزئیات و تحلیل اقتصادی</button></p></div>`;
+}
+
+// خلاصه نتیجه بررسی یکپارچگی ارجاع‌ها (کاتالوگ، ساختار، تجهیز، پروژه)
+function integrityCard(r) {
+  const area = { catalog: "کاتالوگ", site: "مجتمع", structure: "ساختار", data: "داده", projects: "پروژه‌ها" };
+  return html`<div class="card"><h3>بررسی یکپارچگی داده‌ها
+    <span class="chip ${r.errors ? "bad" : r.warnings ? "warn" : "ok"}">${r.errors ? r.errors + " خطا" : "بدون خطا"}${r.warnings ? " · " + r.warnings + " هشدار" : ""}</span></h3>
+   ${r.issues.length ? html`<details ${r.errors ? "open" : ""}><summary>نمایش موارد (${r.issues.length})</summary><table><tr><th>سطح</th><th>بخش</th><th>شرح</th></tr>
+    ${r.issues.map(i => html`<tr><td><span class="chip ${i.level === "error" ? "bad" : "warn"}">${i.level === "error" ? "خطا" : "هشدار"}</span></td><td>${area[i.area] || i.area}</td><td style="white-space:normal">${i.message}</td></tr>`)}</table></details>`
+    : html`<p class="muted">ارجاع‌های بین کاتالوگ، ساختار مجتمع، تجهیزات و پروژه‌ها سازگار است.</p>`}</div>`;
+}
 
 function systemBars(bs) {
   if (!bs.systems.length) return html`<p class="muted">جریانی ثبت نشده است.</p>`;
@@ -169,10 +250,31 @@ function systemBars(bs) {
   const miss = bs.missing_typical_systems;
   return html`<div class="legend"><span><i style="background:var(--pri)"></i>ورودی سیستم</span><span><i style="background:#d9822b"></i>خروجی سیستم</span></div>${rows}
    <p class="note small">ورودی/خروجی شامل جریان‌های داخلی هم می‌شود؛ مجموع سیستم‌ها قابل جمع نیست (خروجی یک سیستم ممکن است ورودی سیستم دیگر باشد).</p>
-   ${miss.length ? html`<p class="note small"><b>شکاف داده:</b> سیستم‌های نوعی صنعت «${bs.industry ? bs.industry.name : ""}» که هنوز تعریف نشده‌اند: ${miss.map(m => m.name).join("، ")}. از «ساختار و جریان‌ها ← اعمال الگوی صنعت» استفاده کنید.</p>` : ""}`;
+   ${miss.length ? html`<p class="note small"><b>شکاف داده:</b> سیستم‌های نوعی صنعت «${bs.industry ? bs.industry.name : ""}» که هنوز تعریف نشده‌اند: ${miss.map(m => m.name).join("، ")}. از «ساختار سیستم آب مجتمع ← اعمال الگوی صنعت» استفاده کنید.</p>` : ""}`;
 }
 
-VIEWS.structure = async v => {
+// خلاصه طبقه‌بندی مجتمع: صنعت/زیرگروه، فرایندها و وضعیت پوشش سیستم‌های نوعی (واحد/جریان/تجهیز ثبت‌شده)
+function classificationCard(s, ind, streams) {
+  const used = {};
+  for (const u of s.units) (used[u.system_code] ||= { units: 0, streams: 0, equipment: 0 }).units++;
+  for (const t of streams) { const c = t.system_code || t.unit_system; if (c) (used[c] ||= { units: 0, streams: 0, equipment: 0 }).streams++; }
+  const unitSys = Object.fromEntries(s.units.map(u => [u.id, u.system_code]));
+  for (const e of s.equipment) {
+    const c = (cat().equipment_types.find(x => x.code === e.kind) || {}).system_code || unitSys[e.unit_id];
+    if (c) (used[c] ||= { units: 0, streams: 0, equipment: 0 }).equipment++;
+  }
+  const sub = (ind.subgroups.find(x => x[0] === s.subgroup_code) || [])[1];
+  const row = c => { const u = used[c]; const n = u ? html`<span class="chip ok">ثبت‌شده: ${u.units} واحد · ${u.streams} جریان · ${u.equipment} تجهیز</span>` : html`<span class="chip warn">هنوز تعریف نشده</span>`;
+    return html`<tr><td>${c}</td><td>${sysName(c)}</td><td>${n}</td></tr>`; };
+  const extra = Object.keys(used).filter(c => !ind.typical_systems.includes(c));
+  return html`<div class="card"><h3>طبقه‌بندی این مجتمع</h3>
+   <div class="kv"><b>گروه صنعتی</b><span>${ind.code} – ${ind.name}${sub ? " ← " + sub : ""}</span>
+    <b>نمونه‌ها</b><span>${ind.examples}</span><b>فرآیندهای مصرف‌کننده آب</b><span>${ind.processes.join("، ")}</span></div>
+   <table><tr><th>کد</th><th>سیستم نوعی صنعت</th><th>وضعیت در این مجتمع</th></tr>${ind.typical_systems.map(row)}
+    ${extra.map(c => html`<tr><td>${c}</td><td>${sysName(c)} <span class="muted small">(خارج از الگوی صنعت)</span></td><td><span class="chip ok">ثبت‌شده: ${used[c].units} واحد · ${used[c].streams} جریان · ${used[c].equipment} تجهیز</span></td></tr>`)}</table>
+   <p><button class="btn small" data-act="structab" data-id="catalog">مشاهده طبقه‌بندی کامل صنایع و سیستم‌ها</button></p></div>`;
+}
+async function structureMain(v) {
   const id = state.siteId;
   const s = id ? await api(`/api/sites/${id}`) : null;
   const streams = id ? await api(`/api/sites/${id}/streams`) : [];
@@ -184,7 +286,6 @@ VIEWS.structure = async v => {
   const dis = canEdit() ? "" : "disabled";
   const typical = curInd.typical_systems.map(c => SYS_FA[c] || c).join("، ");
   v.innerHTML = html`
-  <h2>ساختار مجتمع و جریان‌های آب</h2>
   <div class="card"><h3>${s ? "مشخصات مجتمع" : "تعریف مجتمع جدید"}</h3>
   <form data-form="site" class="form">
     <label>نام<input name="name" required value="${s?.name || ""}" ${dis}></label>
@@ -203,6 +304,7 @@ VIEWS.structure = async v => {
       ${s && state.user.role === "admin" ? html` <button type="button" class="btn danger" data-act="delsite">حذف</button>` : ""}</div>` : ""}
   </form>${s ? html`<p class="muted small">هزینه نهایی هر m³ = <b>${fmt(s.marginal_cost, 0)}</b></p>` : ""}
   <p class="note small" id="indHint">سیستم‌های نوعی این صنعت: ${typical || "—"}</p></div>
+  ${s ? classificationCard(s, curInd, streams) : ""}
   ${s ? html`
   <div class="grid g2">
    <div class="card"><h3>واحدها (سیستم‌های مصرف‌کننده)</h3>
@@ -239,9 +341,20 @@ VIEWS.structure = async v => {
      <p class="note small" id="stHint">با انتخاب «نوع جریان»، جهت، محدوده، مبدأ/مقصد، کیفیت و کاربرد مجاز از کاتالوگ پر می‌شود و قابل ویرایش است.
      جریان «داخلی» در موازنه مرز مجتمع شمرده نمی‌شود؛ فقط «بازیافتی/بازچرخانی/کندانس» در نرخ بازچرخانی لحاظ می‌شوند.</p>` : ""}
   </div>` : ""}`.__raw;
+}
+
+// صفحه «ساختار سیستم آب مجتمع» با دو زیرصفحه: ساختار/جریان‌ها و طبقه‌بندی صنایع و سیستم‌ها
+VIEWS.structure = async v => {
+  const sub = VIEWS.structure.sub || "main";
+  v.innerHTML = html`<h2>ساختار سیستم آب مجتمع</h2>
+   <div class="subtabs">${[["main", "ساختار مجتمع و جریان‌های آب"], ["catalog", "طبقه‌بندی صنایع و سیستم‌های مصرف‌کننده آب"]].map(([k, t]) =>
+     html`<button class="btn ${k === sub ? "primary" : ""}" data-act="structab" data-id="${k}">${t}</button>`)}</div><div id="structBody"></div>`.__raw;
+  const body = $("#structBody");
+  if (sub === "catalog") await VIEWS.catalog(body); else await structureMain(body);
 };
 
 // نمای کاتالوگ: صنایع، سیستم‌ها، انواع جریان، منابع
+
 VIEWS.catalog = async v => {
   const C = cat(); const tab = VIEWS.catalog.tab || "industries";
   const measures = await api("/api/measures"); const mt = Object.fromEntries(measures.map(m => [m.code, m.title]));
@@ -287,8 +400,7 @@ VIEWS.catalog = async v => {
      <p class="note small">${C.instrument_note}</p>`;
   else body = html`<table><tr><th>کد</th><th>دسته منبع</th><th>نمونه‌ها</th></tr>${C.source_categories.map(x => html`<tr><td>${x.code}</td><td>${x.name}</td><td>${x.examples}</td></tr>`)}</table>
     <p class="note small">برای هر منبع باید ثبت شود: ${C.source_attributes.join("، ")}. (در جریان ورودی: دسته منبع، شماره کنتور، عدم قطعیت و کیفیت.)</p>`;
-  v.innerHTML = html`<h2>طبقه‌بندی صنایع و سیستم‌های مصرف‌کننده آب</h2>
-   <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.8rem">${tabs.map(([k, t]) => html`<button class="btn small ${k === tab ? "primary" : ""}" data-act="cattab" data-id="${k}">${t}</button>`)}</div>${body}`.__raw;
+  v.innerHTML = html`<div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.8rem">${tabs.map(([k, t]) => html`<button class="btn small ${k === tab ? "primary" : ""}" data-act="cattab" data-id="${k}">${t}</button>`)}</div>${body}`.__raw;
 };
 
 VIEWS.data = async v => {
@@ -396,36 +508,109 @@ VIEWS.measures = async v => {
    <div class="tablewrap" style="max-height:520px"><table><tr><th>کد</th><th>راهکار</th><th>سلسله‌مراتب</th><th>سیستم</th><th>صرفه‌جویی</th><th>مبنا</th><th>بازگشت</th><th></th></tr>${ms.map(row)}</table></div></div>`.__raw;
 };
 
+// ---------- پروژه‌ها، تحلیل اقتصادی و اولویت‌بندی ----------
+const pct = v => v == null ? "—" : fmt(v * 100, 1) + "٪";
+const yrs = v => v == null ? "—" : fmt(v, 2);
+const unitCost = () => { const t = site(); return t ? ["cost_supply", "cost_pumping", "cost_treatment", "cost_distribution", "cost_disposal"].reduce((a, k) => a + (t[k] || 0), 0) : 0; };
+
+// نمودار جریان نقدی تجمیعی (ساده و تنزیل‌یافته) به‌صورت SVG
+function cashChart(cf, capex) {
+  if (!cf.length) return "";
+  const pts = k => [-capex, ...cf.map(r => r[k])];
+  const A = pts("cumulative"), B = pts("cumulative_discounted"); const all = [...A, ...B];
+  const lo = Math.min(...all, 0), hi = Math.max(...all, 0), W = 560, H = 190, P = 28;
+  const X = i => P + i * (W - 2 * P) / (A.length - 1), Y = v => H - P - (v - lo) / ((hi - lo) || 1) * (H - 2 * P);
+  const line = (arr, c, d = "") => `<polyline fill="none" stroke="${c}" stroke-width="2" ${d} points="${arr.map((v, i) => X(i).toFixed(1) + "," + Y(v).toFixed(1)).join(" ")}"/>`;
+  return { __raw: `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:620px;direction:ltr" role="img" aria-label="جریان نقدی تجمیعی">
+    <line x1="${P}" x2="${W - P}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)" stroke-width="1.5"/>${line(A, "#1d6fa5")}${line(B, "#d9822b", 'stroke-dasharray="5 3"')}
+    <text class="sk-v" x="${P}" y="${H - 6}">سال ۰</text><text class="sk-v" x="${W - P}" y="${H - 6}" text-anchor="end">سال ${A.length - 1}</text>
+    <text class="sk-v" x="${P + 4}" y="14">آبی: تجمیعی ساده · نارنجی: تجمیعی تنزیل‌یافته · محور صفر = بازگشت سرمایه</text></svg>` };
+}
+function indicatorTiles(e) {
+  const tile = (n, val, cls = "") => html`<div class="kpi ${cls}"><div class="n">${n}</div><div class="v">${val}</div></div>`;
+  return html`<div class="grid g4">${tile("بازگشت سرمایه ساده (سال)", yrs(e.simple_payback_years))}${tile("بازگشت تنزیل‌یافته (سال)", yrs(e.discounted_payback_years))}
+   ${tile("ارزش خالص فعلی (NPV)", fmt(e.npv, 0), e.npv < 0 ? "crit" : "")}${tile("نرخ بازده داخلی (IRR)", pct(e.irr))}
+   ${tile("نسبت منفعت به هزینه (BCR)", e.bcr == null ? "—" : fmt(e.bcr, 2), e.bcr != null && e.bcr < 1 ? "crit" : "")}${tile("صرفه‌جویی خالص سال اول", fmt(e.annual_net_saving, 0))}
+   ${tile("هزینه چرخه عمر هر m³ صرفه‌جویی", e.lcc_per_m3 == null ? "—" : fmt(e.lcc_per_m3, 2))}${tile("ارزش فعلی منافع / هزینه‌ها", `${fmt(e.pv_benefits, 0)} / ${fmt(e.pv_costs, 0)}`)}</div>`;
+}
+function cashTable(cf) {
+  return html`<details><summary>جدول جریان نقدی سالانه</summary><div class="tablewrap"><table><tr><th>سال</th><th>منفعت</th><th>هزینه بهره‌برداری</th><th>خالص</th><th>خالص تنزیل‌یافته</th><th>تجمیعی</th><th>تجمیعی تنزیل‌یافته</th></tr>
+   ${cf.map(r => html`<tr><td>${r.year}</td><td class="num">${fmt(r.benefit, 0)}</td><td class="num">${fmt(r.opex, 0)}</td><td class="num">${fmt(r.net, 0)}</td><td class="num">${fmt(r.discounted, 0)}</td><td class="num">${fmt(r.cumulative, 0)}</td><td class="num">${fmt(r.cumulative_discounted, 0)}</td></tr>`)}</table></div></details>`;
+}
+
 VIEWS.projects = async v => {
-  const id = state.siteId;
-  const [ps, rk] = await Promise.all([api(`/api/sites/${id}/projects`), api(`/api/sites/${id}/ranking`)]);
+  const id = state.siteId, tab = VIEWS.projects.tab || "list";
+  const tabs = html`<div class="subtabs">${[["list", "پروژه‌ها و اولویت‌بندی"], ["economics", "ماژول تحلیل اقتصادی"]].map(([k, t]) =>
+    html`<button class="btn ${k === tab ? "primary" : ""}" data-act="projtab" data-id="${k}">${t}</button>`)}</div>`;
+  if (tab === "economics") return projectsEconomics(v, tabs);
+  const [ps, rk, pf, measures, rec] = await Promise.all([api(`/api/sites/${id}/projects`), api(`/api/sites/${id}/ranking`),
+    api(`/api/sites/${id}/projects/portfolio?scope=selected`), api("/api/measures"), api(`/api/sites/${id}/recommendations`)]);
   const pre = VIEWS.projects.prefill || {}; VIEWS.projects.prefill = null;
-  v.innerHTML = html`<h2>پروژه‌ها و اولویت‌بندی</h2>
+  VIEWS.projects.measures = measures;
+  const recIds = new Set(rec.map(m => m.id)); const recOrdered = rec.slice().sort((a, b) => (b.flagship - a.flagship));
+  const opt = m => html`<option value="${m.id}" ${m.id === pre.measure_id ? "selected" : ""}>${m.code} – ${m.title}${m.flagship ? " ★" : ""}</option>`;
+  v.innerHTML = html`<h2>پروژه‌ها و اولویت‌بندی</h2>${tabs}
   ${canEdit() ? html`<div class="card"><h3>پروژه جدید</h3><form data-form="project" class="form">
-   <input type="hidden" name="measure_id" value="${pre.measure_id || ""}">
-   <label>عنوان<input name="title" required value="${pre.title || ""}"></label>
+   <label style="grid-column:1/-1">انتخاب راهکار منتخب از بانک راهکارها (عنوان و مشخصات پر می‌شود)
+    <select name="measure_id" id="measurePick"><option value="">— پروژه آزاد (بدون راهکار مرجع) —</option>
+     <optgroup label="پیشنهادی برای این مجتمع (★ = راهکار شاخص صنعت)">${recOrdered.map(opt)}</optgroup>
+     <optgroup label="سایر راهکارهای بانک">${measures.filter(m => !recIds.has(m.id)).map(opt)}</optgroup></select></label>
+   <div id="measureHint" class="note small" style="grid-column:1/-1">${pre.measure_id ? measureHint(measures.find(m => m.id === pre.measure_id)) : "پس از انتخاب راهکار، صرفه‌جویی/سرمایه‌گذاری/بازگشت نوعی آن اینجا نمایش داده می‌شود."}</div>
+   <label>عنوان پروژه<input name="title" required value="${pre.title || ""}"></label>
    <label>صرفه‌جویی (m³/سال)<input name="saving_m3_year" type="number" min="0" step="any" required></label>
    <label>سرمایه‌گذاری CAPEX<input name="capex" type="number" min="0" step="any" value="0"></label>
    <label>هزینه بهره‌برداری سالانه<input name="opex_year" type="number" min="0" step="any" value="0"></label>
    <label>عمر (سال)<input name="life_years" type="number" min="1" max="50" value="10"></label>
-   <label>نرخ تنزیل<input name="discount_rate" type="number" min="0" max="1" step="any" value="0.15"></label>
+   <label>نرخ تنزیل (٪)<input name="discount_rate" type="number" min="0" max="100" step="any" value="15"></label>
+   <label>رشد سالانه هزینه آب (٪)<input name="escalation" type="number" min="-50" max="100" step="any" value="0"></label>
+   <label>رشد سالانه هزینه بهره‌برداری (٪)<input name="opex_escalation" type="number" min="-50" max="100" step="any" value="0"></label>
+   <label>ارزش اسقاط (پایان عمر)<input name="salvage_value" type="number" min="0" step="any" value="0"></label>
    <label>سهولت اجرا (۱-۵)<input name="ease" type="number" min="1" max="5" value="${pre.ease || 3}"></label>
    <label>کاهش ریسک تأمین (۱-۵)<input name="supply_risk" type="number" min="1" max="5" value="3"></label>
    <label>اثر زیست‌محیطی مثبت (۱-۵)<input name="environment" type="number" min="1" max="5" value="3"></label>
    <label>ریسک فنی (۱-۵؛ بالاتر = بدتر)<input name="tech_risk" type="number" min="1" max="5" value="${pre.tech_risk || 3}"></label>
    <button class="btn primary">ثبت پروژه</button></form></div>` : ""}
-  <div class="card"><h3>پروژه‌ها (هزینه هر m³ آب: ${fmt(site().cost_supply + site().cost_pumping + site().cost_treatment + site().cost_distribution + site().cost_disposal, 0)})</h3>
-   <div class="tablewrap"><table><tr><th>پروژه</th><th>صرفه‌جویی m³/سال</th><th>CAPEX</th><th>OPEX</th><th>صرفه‌جویی خالص/سال</th><th>بازگشت (سال)</th><th>NPV</th><th>IRR</th><th>وضعیت</th><th></th></tr>
-   ${ps.map(p => html`<tr><td>${p.title}</td><td class="num">${fmt(p.saving_m3_year, 0)}</td><td class="num">${fmt(p.capex, 0)}</td><td class="num">${fmt(p.opex_year, 0)}</td>
-    <td class="num">${fmt(p.economics.annual_net_saving, 0)}</td><td class="num">${fmt(p.economics.payback_years, 2)}</td><td class="num">${fmt(p.economics.npv, 0)}</td>
-    <td class="num">${p.economics.irr == null ? "—" : fmt(p.economics.irr * 100, 1) + "٪"}</td>
+  <div class="card"><h3>پروژه‌ها (هزینه هر m³ آب: ${fmt(unitCost(), 2)})</h3>
+   ${canEdit() ? html`<p><button class="btn small" data-act="pselall">انتخاب همه</button> <button class="btn small" data-act="pselnone">لغو همه انتخاب‌ها</button>
+     <span class="muted small">تیک «منتخب» = راهکارهای منتخب برای برنامه اجرا؛ شاخص‌های تجمیعی آن‌ها در پایین و در داشبورد نمایش داده می‌شود.</span></p>` : ""}
+   <div class="tablewrap"><table><tr><th>منتخب</th><th>پروژه</th><th>صرفه‌جویی m³/سال</th><th>CAPEX</th><th>OPEX</th><th>خالص/سال</th><th>بازگشت ساده</th><th>بازگشت تنزیل‌یافته</th><th>NPV</th><th>IRR</th><th>BCR</th><th>وضعیت</th><th></th></tr>
+   ${ps.map(p => html`<tr><td><input type="checkbox" data-act="psel" data-id="${p.id}" ${p.selected ? "checked" : ""} ${canEdit() && p.status !== "rejected" ? "" : "disabled"}></td>
+    <td>${p.title}${p.measure_code ? html` <span class="chip">${p.measure_code}</span>` : ""}</td><td class="num">${fmt(p.saving_m3_year, 0)}</td><td class="num">${fmt(p.capex, 0)}</td><td class="num">${fmt(p.opex_year, 0)}</td>
+    <td class="num">${fmt(p.economics.annual_net_saving, 0)}</td><td class="num">${yrs(p.economics.simple_payback_years)}</td><td class="num">${yrs(p.economics.discounted_payback_years)}</td>
+    <td class="num">${fmt(p.economics.npv, 0)}</td><td class="num">${pct(p.economics.irr)}</td><td class="num">${p.economics.bcr == null ? "—" : fmt(p.economics.bcr, 2)}</td>
     <td>${canEdit() ? html`<select data-act="pstatus" data-id="${p.id}">${Object.entries(PSTATUS).map(([k, t]) => html`<option value="${k}" ${k === p.status ? "selected" : ""}>${t}</option>`)}</select>` : PSTATUS[p.status]}</td>
-    <td>${canEdit() ? html`<button class="btn small danger" data-act="delproject" data-id="${p.id}">حذف</button>` : ""}</td></tr>`)}</table></div>
-   <p class="note small">جمع صرفه‌جویی پروژه‌ها فقط در صورت استقلال فنی آن‌ها معتبر است (هم‌پوشانی ممکن است).</p></div>
-  <div class="card"><h3>رتبه‌بندی (امتیازدهی وزنی چندمعیاره)</h3><table><tr><th>رتبه</th><th>پروژه</th><th>امتیاز (۰-۱۰۰)</th><th>صرفه‌جویی m³/سال</th></tr>
-   ${rk.map(r => html`<tr><td>${r.rank}</td><td>${r.name}</td><td class="num">${r.score}</td><td class="num">${fmt(r.saving_m3_year, 0)}</td></tr>`)}</table>
-   <p class="muted small">وزن‌ها: صرفه‌جویی ۲۵٪، اقتصاد ۲۰٪، سهولت ۱۵٪، ریسک تأمین ۱۵٪، محیط‌زیست ۱۵٪، ریسک فنی ۱۰٪.</p></div>`.__raw;
+    <td><button class="btn small" data-act="pdetail" data-id="${p.id}">جزئیات</button>${canEdit() ? html` <button class="btn small danger" data-act="delproject" data-id="${p.id}">حذف</button>` : ""}</td></tr>`)}</table></div>
+   <p class="note small">جمع صرفه‌جویی پروژه‌ها فقط در صورت استقلال فنی آن‌ها معتبر است (هم‌پوشانی ممکن است).</p><div id="pdetail"></div></div>
+  <div class="card"><h3>ارزیابی تجمیعی راهکارهای منتخب ${pf.count ? `(${pf.count} پروژه)` : ""}</h3>
+   ${pf.count ? html`${indicatorTiles({ ...pf, annual_net_saving: pf.annual_net_saving, lcc_per_m3: null })}
+     <p class="note small">صرفه‌جویی کل: ${fmt(pf.saving_m3_year, 0)} m³/سال${pf.share_of_site_input_pct != null ? ` (${fmt(pf.share_of_site_input_pct, 1)}٪ ورودی سالانه مجتمع)` : ""}. IRR و بازگشت‌ها از جریان نقدی جمع‌شده سال‌به‌سال محاسبه شده‌اند.</p>
+     ${cashChart(pf.cash_flows, pf.capex)}${cashTable(pf.cash_flows.map(r => ({ ...r, benefit: 0, opex: 0 })))}`
+    : html`<p class="muted">هنوز راهکاری منتخب نشده است؛ در جدول بالا ستون «منتخب» را علامت بزنید.</p>`}</div>
+  <div class="card"><h3>رتبه‌بندی (امتیازدهی وزنی چندمعیاره)</h3>
+   <p><button class="btn small ${VIEWS.projects.rankSel ? "" : "primary"}" data-act="rankscope" data-id="all">همه پروژه‌ها</button>
+      <button class="btn small ${VIEWS.projects.rankSel ? "primary" : ""}" data-act="rankscope" data-id="sel">فقط منتخب‌ها</button></p>
+   <div id="rankBox">${rankTable(VIEWS.projects.rankSel ? rk.filter(r => ps.find(p => p.id === r.id && p.selected)).map((r, i) => ({ ...r, rank: i + 1 })) : rk)}</div>
+   <p class="muted small">وزن‌ها: صرفه‌جویی ۲۵٪، اقتصاد ۲۰٪، سهولت ۱۵٪، ریسک تأمین ۱۵٪، محیط‌زیست ۱۵٪، ریسک فنی ۱۰٪. امتیاز اقتصادی بر پایه بازگشت ساده است.</p></div>`.__raw;
 };
+const rankTable = rk => html`<table><tr><th>رتبه</th><th>پروژه</th><th>امتیاز (۰-۱۰۰)</th><th>صرفه‌جویی m³/سال</th></tr>
+  ${rk.map(r => html`<tr><td>${r.rank}</td><td>${r.name}</td><td class="num">${r.score}</td><td class="num">${fmt(r.saving_m3_year, 0)}</td></tr>`)}</table>`;
+const measureHint = m => !m ? "" : html`<b>${m.code} – ${m.title}</b> · ${HIER_FA[m.hierarchy] || ""} · سیستم ${sysName(m.system_code)}<br>
+  صرفه‌جویی نوعی: ${m.saving_min_pct ?? "؟"}–${m.saving_max_pct ?? "؟"}٪ ${m.saving_basis ? "از " + m.saving_basis : ""} · سرمایه‌گذاری: ${m.capex_note || "—"} · بازگشت: ${m.payback_note || "—"}`;
+
+// ماژول مستقل تحلیل اقتصادی: ارزیابی یک راهکار با ورودی دلخواه یا بارگذاری از پروژه‌های ثبت‌شده
+async function projectsEconomics(v, tabs) {
+  const ps = await api(`/api/sites/${state.siteId}/projects`);
+  const d = VIEWS.projects.econDraft || { saving_m3_year: 10000, unit_cost: unitCost() || 1, capex: 50000, opex_year: 2000, life_years: 10, discount_rate: 15, escalation: 0, opex_escalation: 0, salvage_value: 0 };
+  const f = (n, l, st = "any", extra = "") => html`<label>${l}<input name="${n}" type="number" step="${st}" min="0" value="${d[n]}" ${extra}></label>`;
+  v.innerHTML = html`<h2>پروژه‌ها و اولویت‌بندی</h2>${tabs}
+  <div class="card"><h3>ماژول تحلیل اقتصادی راهکارهای صرفه‌جویی</h3>
+   <p class="note small">منفعت سال t = صرفه‌جویی آب × هزینه نهایی هر m³ × (1+رشد)<sup>t−1</sup>؛ CAPEX در سال صفر؛ NPV با نرخ تنزیل؛ BCR = ارزش فعلی منافع ÷ (CAPEX + ارزش فعلی هزینه‌های بهره‌برداری).</p>
+   <p><label style="max-width:420px">بارگذاری مشخصات از پروژه ثبت‌شده<select id="econLoad"><option value="">— ورودی دستی —</option>${ps.map(p => html`<option value="${p.id}">${p.title}</option>`)}</select></label></p>
+   <form data-form="econ" class="form">${f("saving_m3_year", "صرفه‌جویی (m³/سال)")}${f("unit_cost", "هزینه نهایی هر m³ آب (پیش‌فرض: هزینه‌های مجتمع)")}${f("capex", "سرمایه‌گذاری CAPEX")}${f("opex_year", "هزینه بهره‌برداری سالانه")}
+    ${f("life_years", "عمر (سال)", "1", 'max="50"')}${f("discount_rate", "نرخ تنزیل (٪)")}${f("escalation", "رشد سالانه هزینه آب (٪)")}${f("opex_escalation", "رشد سالانه هزینه بهره‌برداری (٪)")}${f("salvage_value", "ارزش اسقاط")}
+    <button class="btn primary">محاسبه شاخص‌ها</button></form><div id="econOut"></div></div>`.__raw;
+  if (VIEWS.projects.econDraft) await FORMS.econ($("form[data-form=econ]"));
+}
 
 VIEWS.kpis = async v => {
   const defs = await api("/api/kpi-defs");
@@ -511,9 +696,20 @@ const FORMS = {
   },
   async project(f) {
     const d = formData(f); d.measure_id = num(d.measure_id);
-    ["saving_m3_year", "capex", "opex_year", "discount_rate"].forEach(k => d[k] = Number(d[k]));
+    ["saving_m3_year", "capex", "opex_year", "salvage_value"].forEach(k => d[k] = Number(d[k]));
+    ["discount_rate", "escalation", "opex_escalation"].forEach(k => d[k] = Number(d[k]) / 100);
     ["life_years", "ease", "supply_risk", "environment", "tech_risk"].forEach(k => d[k] = parseInt(d[k], 10));
     await api(`/api/sites/${state.siteId}/projects`, { method: "POST", body: d }); toast("پروژه ثبت شد"); render();
+  },
+  async econ(f) {
+    const d = formData(f); const body = {};
+    for (const k of ["saving_m3_year", "unit_cost", "capex", "opex_year", "salvage_value"]) body[k] = Number(d[k]);
+    body.life_years = parseInt(d.life_years, 10);
+    for (const k of ["discount_rate", "escalation", "opex_escalation"]) body[k] = Number(d[k]) / 100;
+    VIEWS.projects.econDraft = { ...d };
+    const e = await api("/api/economics/evaluate", { method: "POST", body });
+    $("#econOut").innerHTML = html`<div style="margin-top:1rem">${indicatorTiles(e)}${cashChart(e.cash_flows, body.capex)}${cashTable(e.cash_flows)}
+      ${canEdit() ? html`<p><button type="button" class="btn" data-act="econtoproject">ثبت به‌عنوان پروژه</button></p>` : ""}</div>`.__raw;
   },
   async kpidef(f) { const d = formData(f); d.warn = num(d.warn); d.critical = num(d.critical); d.grp = "custom"; await api("/api/kpi-defs", { method: "POST", body: d }); toast("شاخص ذخیره شد"); render(); },
   async user(f) { await api("/api/users", { method: "POST", body: formData(f) }); toast("کاربر افزوده شد"); render(); },
@@ -536,6 +732,28 @@ const ACTS = {
   },
   eqsys(b) { VIEWS.catalog.sys = b.value; render(); },
   cattab(b) { VIEWS.catalog.tab = b.dataset.id; render(); },
+  projtab(b) { VIEWS.projects.tab = b.dataset.id; render(); },
+  rankscope(b) { VIEWS.projects.rankSel = b.dataset.id === "sel"; render(); },
+  async psel() {
+    const ids = [...document.querySelectorAll("input[data-act=psel]:checked")].map(x => Number(x.dataset.id));
+    await api(`/api/sites/${state.siteId}/projects/select`, { method: "POST", body: { ids } }); toast("مجموعه منتخب بروزرسانی شد"); render();
+  },
+  async pselall() {
+    const ids = [...document.querySelectorAll("input[data-act=psel]:not(:disabled)")].map(x => Number(x.dataset.id));
+    await api(`/api/sites/${state.siteId}/projects/select`, { method: "POST", body: { ids } }); render();
+  },
+  async pselnone() { await api(`/api/sites/${state.siteId}/projects/select`, { method: "POST", body: { ids: [] } }); render(); },
+  async pdetail(b) {
+    const p = await api(`/api/sites/${state.siteId}/projects/${b.dataset.id}`);
+    $("#pdetail").innerHTML = html`<h3 style="margin-top:1rem">جزئیات اقتصادی: ${p.title}</h3>${indicatorTiles(p.economics)}${cashChart(p.economics.cash_flows, p.capex)}${cashTable(p.economics.cash_flows)}`.__raw;
+    $("#pdetail").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  },
+  econtoproject() {
+    const e = VIEWS.projects.econDraft || {};
+    VIEWS.projects.prefill = { title: "" }; VIEWS.projects.tab = "list"; VIEWS.projects.econPrefill = e; render();
+  },
+  goto(b) { state.page = b.dataset.id; render(); },
+  structab(b) { VIEWS.structure.sub = b.dataset.id; render(); },
   sysmeasures(b) { VIEWS.measures.system = b.dataset.id; state.page = "measures"; render(); },
   syscalc(b) { if (CALC[b.dataset.id]) VIEWS.calc.kind = b.dataset.id; state.page = "calc"; render(); },
   clearsys() { VIEWS.measures.system = ""; render(); },

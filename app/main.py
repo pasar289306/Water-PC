@@ -22,6 +22,7 @@ from . import auth, services
 from .db import db, init_db, rows, one
 from .engine import equipment as eq
 from .engine.kpi import safe_eval, FormulaError
+from .engine.economics import measure_economics
 from .report import build_report
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
@@ -173,7 +174,24 @@ class ProjectIn(BaseModel):
     supply_risk: int = Field(3, ge=1, le=5)
     environment: int = Field(3, ge=1, le=5)
     tech_risk: int = Field(3, ge=1, le=5)
+    escalation: float = Field(0, ge=-0.5, le=1)         # رشد سالانه هزینه آب
+    opex_escalation: float = Field(0, ge=-0.5, le=1)
+    salvage_value: float = Field(0, ge=0)
+    selected: bool = False
     status: Literal["proposed", "approved", "in_progress", "done", "rejected"] = "proposed"
+
+
+class EconomicsIn(BaseModel):
+    """ورودی ماژول مستقل تحلیل اقتصادی (بدون ذخیره)."""
+    saving_m3_year: float = Field(ge=0)
+    unit_cost: float = Field(ge=0)                       # هزینه نهایی هر m³ آب
+    capex: float = Field(0, ge=0)
+    opex_year: float = Field(0, ge=0)
+    life_years: int = Field(10, ge=1, le=50)
+    discount_rate: float = Field(0.15, ge=0, le=1)
+    escalation: float = Field(0, ge=-0.5, le=1)
+    opex_escalation: float = Field(0, ge=-0.5, le=1)
+    salvage_value: float = Field(0, ge=0)
 
 
 class KpiDefIn(BaseModel):
@@ -985,9 +1003,11 @@ async def add_project(request: Request):
         if p.measure_id and not one(c.execute("SELECT id FROM measures WHERE id=?", (p.measure_id,))):
             raise HTTPException(404, "راهکار یافت نشد")
         cur = c.execute("""INSERT INTO projects(site_id,measure_id,title,saving_m3_year,capex,opex_year,life_years,
-            discount_rate,ease,supply_risk,environment,tech_risk,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            discount_rate,ease,supply_risk,environment,tech_risk,status,escalation,opex_escalation,salvage_value,selected)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (site_id, p.measure_id, p.title, p.saving_m3_year, p.capex, p.opex_year, p.life_years,
-                         p.discount_rate, p.ease, p.supply_risk, p.environment, p.tech_risk, p.status))
+                         p.discount_rate, p.ease, p.supply_risk, p.environment, p.tech_risk, p.status,
+                         p.escalation, p.opex_escalation, p.salvage_value, int(p.selected)))
     auth.log(u, "create", "project", cur.lastrowid, p.title)
     return ok({"id": cur.lastrowid}, 201)
 
@@ -998,9 +1018,11 @@ async def update_project(request: Request):
     p = parse(ProjectIn, await body(request))
     with db() as c:
         cur = c.execute("""UPDATE projects SET measure_id=?,title=?,saving_m3_year=?,capex=?,opex_year=?,life_years=?,
-            discount_rate=?,ease=?,supply_risk=?,environment=?,tech_risk=?,status=? WHERE id=? AND site_id=?""",
+            discount_rate=?,ease=?,supply_risk=?,environment=?,tech_risk=?,status=?,escalation=?,opex_escalation=?,
+            salvage_value=?,selected=? WHERE id=? AND site_id=?""",
                         (p.measure_id, p.title, p.saving_m3_year, p.capex, p.opex_year, p.life_years, p.discount_rate,
-                         p.ease, p.supply_risk, p.environment, p.tech_risk, p.status, pid, site_id))
+                         p.ease, p.supply_risk, p.environment, p.tech_risk, p.status, p.escalation, p.opex_escalation,
+                         p.salvage_value, int(p.selected), pid, site_id))
         if cur.rowcount == 0:
             raise HTTPException(404, "پروژه یافت نشد")
     auth.log(u, "update", "project", pid)
@@ -1022,7 +1044,78 @@ def project_ranking(request: Request):
     auth.require(request)
     site_id = sid(request)
     get_site(site_id)
-    return ok(services.ranking(site_id))
+    r = services.ranking(site_id)
+    if request.query_params.get("selected") in ("1", "true"):
+        sel = {p["id"] for p in services.site_projects(site_id) if p["selected"]}
+        r = [x for x in r if x["id"] in sel]
+        for i, x in enumerate(r, 1):
+            x["rank"] = i
+    return ok(r)
+
+
+def project_detail(request: Request):
+    """جزئیات یک پروژه همراه با جدول جریان نقدی سالانه."""
+    auth.require(request)
+    site_id, pid = sid(request), int(request.path_params["project_id"])
+    get_site(site_id)
+    p = next((x for x in services.site_projects(site_id, with_flows=True) if x["id"] == pid), None)
+    if not p:
+        raise HTTPException(404, "پروژه یافت نشد")
+    return ok(p)
+
+
+async def select_projects(request: Request):
+    """تعیین مجموعه راهکارهای منتخب: دقیقاً پروژه‌های فهرست‌شده منتخب می‌شوند و بقیه از انتخاب خارج."""
+    u = auth.require(request, "engineer")
+    site_id = sid(request)
+    get_site(site_id)
+    d = await body(request)
+    ids = d.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise HTTPException(422, "ids باید فهرستی از شناسه پروژه‌ها باشد")
+    with db() as c:
+        have = {r["id"] for r in rows(c.execute("SELECT id FROM projects WHERE site_id=?", (site_id,)))}
+        bad = [i for i in ids if i not in have]
+        if bad:
+            raise HTTPException(404, f"پروژه(ها) یافت نشد: {bad}")
+        c.execute("UPDATE projects SET selected=0 WHERE site_id=?", (site_id,))
+        for i in ids:
+            c.execute("UPDATE projects SET selected=1 WHERE id=? AND site_id=?", (i, site_id))
+    auth.log(u, "select", "projects", site_id, ",".join(map(str, ids)))
+    return ok({"selected": ids})
+
+
+def project_portfolio(request: Request):
+    auth.require(request)
+    site_id = sid(request)
+    get_site(site_id)
+    scope = request.query_params.get("scope", "selected")
+    if scope not in ("selected", "all"):
+        raise HTTPException(422, "scope باید selected یا all باشد")
+    return ok(services.portfolio(site_id, scope))
+
+
+async def economics_evaluate(request: Request):
+    """ماژول مستقل تحلیل اقتصادی: بازگشت ساده و تنزیل‌یافته، NPV، IRR و BCR برای ورودی دلخواه."""
+    auth.require(request)
+    d = parse(EconomicsIn, await body(request))
+    try:
+        return ok(measure_economics(d.saving_m3_year, d.unit_cost, d.capex, d.opex_year, d.life_years,
+                                    d.discount_rate, d.escalation, d.opex_escalation, d.salvage_value))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+def integrity_global(request: Request):
+    auth.require(request)
+    return ok(services.integrity(None, set(CALCS)))
+
+
+def integrity_site(request: Request):
+    auth.require(request)
+    site_id = sid(request)
+    get_site(site_id)
+    return ok(services.integrity(site_id, set(CALCS)))
 
 
 def audit_log_view(request: Request):
@@ -1096,6 +1189,12 @@ routes = [
     Route(S + "/projects/{project_id:int}", update_project, methods=["PUT"]),
     Route(S + "/projects/{project_id:int}", delete_project, methods=["DELETE"]),
     Route(S + "/ranking", project_ranking),
+    Route(S + "/projects/select", select_projects, methods=["POST"]),
+    Route(S + "/projects/portfolio", project_portfolio),
+    Route(S + "/projects/{project_id:int}", project_detail),
+    Route(S + "/integrity", integrity_site),
+    Route("/api/integrity", integrity_global),
+    Route("/api/economics/evaluate", economics_evaluate, methods=["POST"]),
     Route(S + "/report", report),
     Route("/api/calc/{kind}", calc, methods=["POST"]),
     Route("/api/formula/test", test_formula, methods=["POST"]),
