@@ -22,6 +22,14 @@ def build_report(site_id: int, period: str | None) -> str:
     projects = services.site_projects(site_id)
     rank = services.ranking(site_id)
     mc = services.marginal_cost(site)
+    sysacc = services.by_system(site_id, period)
+    with db() as c:
+        ind = one(c.execute("SELECT name, subgroups FROM industries WHERE code=?", (site["industry_code"],)))
+    import json as _json
+    sub_name = ""
+    if ind and site.get("subgroup_code"):
+        sub_name = next((n for code, n in _json.loads(ind["subgroups"]) if code == site["subgroup_code"]), "")
+    ind_label = (f"{site['industry_code']} – {ind['name']}" if ind else site["industry_code"]) + (f" / {sub_name}" if sub_name else "")
 
     def tr(*cells):
         return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
@@ -34,6 +42,10 @@ def build_report(site_id: int, period: str | None) -> str:
                            fmt(p["economics"]["payback_years"], 1), fmt(p["economics"]["npv"], 0),
                            fmt(p["economics"]["irr"] * 100 if p["economics"]["irr"] is not None else None, 1),
                            e(p["status"])) for p in projects)
+    sys_rows = "".join(tr(e(s["code"] if s["code"] != "UNASSIGNED" else "—"), e(s["name"]), fmt(s["in_total"], 0), fmt(s["out_total"], 0),
+                          fmt(s["difference"], 0), fmt(s["share_of_site_input_pct"], 1) if s["share_of_site_input_pct"] is not None else "—")
+                       for s in sysacc["systems"])
+    missing = "".join(f"<li>{e(m['code'])} – {e(m['name'])}</li>" for m in sysacc["missing_typical_systems"])
     rank_rows = "".join(tr(r["rank"], e(r["name"]), r["score"], fmt(r["saving_m3_year"], 0)) for r in rank)
     warn = "".join(f"<li>{e(w)}</li>" for w in bal["warnings"])
     total_saving = sum(p["saving_m3_year"] for p in projects if p["status"] != "rejected")
@@ -52,7 +64,7 @@ th{{background:#eaf2f8}} .note{{background:#fff7e0;border:1px solid #f0d58a;padd
 .card b{{display:block;font-size:1.2rem}} @media print{{body{{margin:0}}}}
 </style></head><body>
 <h1>گزارش ممیزی و موازنه آب</h1>
-<p><b>مجتمع:</b> {e(site['name'])} &nbsp; <b>دوره:</b> {e(bal['period'])} &nbsp; <b>تاریخ تهیه:</b> {date.today().isoformat()}</p>
+<p><b>مجتمع:</b> {e(site['name'])} &nbsp; <b>صنعت:</b> {e(ind_label)} &nbsp; <b>دوره:</b> {e(bal['period'])} &nbsp; <b>تاریخ تهیه:</b> {date.today().isoformat()}</p>
 
 <h2>۱. موازنه آب سایت</h2>
 <div class="grid">
@@ -68,15 +80,20 @@ th{{background:#eaf2f8}} .note{{background:#fff7e0;border:1px solid #f0d58a;padd
 {f'<h3>هشدارهای کیفیت داده</h3><ul>{warn}</ul>' if warn else ''}
 <table><tr><th>جریان</th><th>جهت</th><th>نوع</th><th>حجم (m³)</th><th>تعداد قرائت</th><th>داده مشکوک/نامعتبر</th></tr>{stream_rows}</table>
 
-<h2>۲. شاخص‌های عملکرد (KPI)</h2>
+<h2>۲. مصرف به تفکیک سیستم‌های مصرف‌کننده</h2>
+<table><tr><th>کد</th><th>سیستم</th><th>ورودی (m³)</th><th>خروجی (m³)</th><th>اختلاف</th><th>سهم از ورودی مجتمع٪</th></tr>{sys_rows or '<tr><td colspan=6>جریانی به سیستم‌ها اختصاص داده نشده است</td></tr>'}</table>
+<p class="note">ورودی/خروجی هر سیستم شامل جریان‌های داخلی هم هست؛ مجموع ستون‌ها بین سیستم‌ها قابل جمع نیست (خروجی یک سیستم می‌تواند ورودی سیستم دیگر باشد). «سهم از ورودی مجتمع» فقط برای جریان‌های ورودی از مرز مجتمع است.</p>
+{f'<h3>سیستم‌های نوعی این صنعت که هنوز تعریف نشده‌اند (شکاف داده)</h3><ul>{missing}</ul>' if missing else ''}
+
+<h2>۳. شاخص‌های عملکرد (KPI)</h2>
 <table><tr><th>شاخص</th><th>مقدار</th><th>واحد</th><th>وضعیت</th></tr>{kpi_rows}</table>
 
-<h2>۳. پروژه‌های صرفه‌جویی</h2>
+<h2>۴. پروژه‌های صرفه‌جویی</h2>
 <p>هزینه نهایی هر مترمکعب آب (تأمین+پمپاژ+تصفیه+توزیع+دفع): <b>{fmt(mc,0)}</b> واحد پول. مجموع صرفه‌جویی پروژه‌های فعال: <b>{fmt(total_saving,0)} m³/سال</b>.</p>
 <table><tr><th>پروژه</th><th>صرفه‌جویی (m³/سال)</th><th>CAPEX</th><th>OPEX/سال</th><th>بازگشت (سال)</th><th>NPV</th><th>IRR٪</th><th>وضعیت</th></tr>{proj_rows or '<tr><td colspan=8>پروژه‌ای ثبت نشده است</td></tr>'}</table>
 <p class="note">پروژه‌ها ممکن است هم‌پوشانی داشته باشند؛ جمع صرفه‌جویی‌ها فقط در صورت استقلال فنی پروژه‌ها معتبر است.</p>
 
-<h2>۴. اولویت‌بندی</h2>
+<h2>۵. اولویت‌بندی</h2>
 <table><tr><th>رتبه</th><th>پروژه</th><th>امتیاز</th><th>صرفه‌جویی (m³/سال)</th></tr>{rank_rows or '<tr><td colspan=4>—</td></tr>'}</table>
 <p style="font-size:.8rem;color:#555">تولید شده توسط AquaAudit. نتایج مبتنی بر داده‌های واردشده‌اند و باید توسط مهندس مسئول تأیید شوند.</p>
 </body></html>"""

@@ -123,3 +123,64 @@ def wastewater_plant(q_in_m3d: float, q_out_m3d: float, cod_in: float, cod_out: 
     if energy_kwh_d is not None and q_out_m3d:
         out["energy_kwh_m3"] = energy_kwh_d / q_out_m3d
     return out
+
+
+# ---------------- واحد DM / تبادل یونی ----------------
+def dm_plant(feed_m3: float, product_m3: float, regen_waste_m3: float | None = None,
+             ec_feed: float | None = None, ec_product: float | None = None) -> dict:
+    """بازیابی واحد و نسبت پساب احیا به آب تولیدی (سند ۶.۱ برای SYS-07)."""
+    if feed_m3 <= 0 or product_m3 < 0:
+        raise ValueError("حجم خوراک باید مثبت و حجم محصول نامنفی باشد")
+    w: list[str] = []
+    rec = product_m3 / feed_m3 * 100
+    waste = regen_waste_m3 if regen_waste_m3 is not None else max(feed_m3 - product_m3, 0.0)
+    out = {"recovery_pct": rec, "regen_waste_m3": waste,
+           "waste_ratio": waste / product_m3 if product_m3 else None, "warnings": w}
+    _chk(product_m3 > feed_m3, "حجم محصول بیشتر از خوراک است؛ داده‌ها را بررسی کنید.", w)
+    _chk(rec < 85, "بازیابی DM پایین (<۸۵٪)؛ بررسی دفعات احیا و آبکشی.", w)
+    if ec_feed and ec_product is not None:
+        out["conductivity_rejection_pct"] = (1 - ec_product / ec_feed) * 100
+    return out
+
+
+# ---------------- شبکه توزیع و آتش‌نشانی ----------------
+def distribution(v_input_m3: float, v_delivered_m3: float, q_night_m3h: float | None = None,
+                 q_avg_m3h: float | None = None, test_volume_m3: float = 0.0) -> dict:
+    """درصد تلفات شبکه و سهم جریان پایه شبانه؛ حجم آزمون‌های آتش‌نشانی به‌عنوان مصرف مجاز کسر می‌شود."""
+    if v_input_m3 <= 0:
+        raise ValueError("حجم ورودی شبکه باید مثبت باشد")
+    w: list[str] = []
+    loss = v_input_m3 - v_delivered_m3 - test_volume_m3
+    out = {"loss_m3": loss, "loss_pct": loss / v_input_m3 * 100, "warnings": w}
+    _chk(loss < 0, "تحویل بیشتر از ورودی است؛ خطای اندازه‌گیری/کنتور.", w)
+    _chk(out["loss_pct"] > 15, "تلفات شبکه بالای ۱۵٪؛ نشت‌یابی و ممیزی کنتورها.", w)
+    if q_night_m3h is not None and q_avg_m3h:
+        out["night_flow_pct"] = q_night_m3h / q_avg_m3h * 100
+        _chk(out["night_flow_pct"] > 30, "جریان پایه شب بالاست؛ احتمال نشتی.", w)
+    return out
+
+
+# ---------------- مصارف بهداشتی ----------------
+def sanitary(volume_m3: float, persons: float, days: float, benchmark_l_person_day: float = 60.0) -> dict:
+    if persons <= 0 or days <= 0:
+        raise ValueError("تعداد افراد و روز باید مثبت باشد")
+    q = volume_m3 * 1000.0 / (persons * days)
+    w: list[str] = []
+    _chk(q > benchmark_l_person_day * 1.3, "مصرف سرانه بیش از ۱۳۰٪ مبنا؛ بررسی شیرآلات، فلاش‌تانک و نشتی.", w)
+    return {"per_capita_l_person_day": q, "benchmark_l_person_day": benchmark_l_person_day,
+            "excess_m3": max(volume_m3 - benchmark_l_person_day * persons * days / 1000.0, 0.0), "warnings": w}
+
+
+# ---------------- آبیاری فضای سبز ----------------
+def irrigation(area_m2: float, et0_mm_day: float, kc: float, days: float, actual_m3: float,
+               effective_rain_mm: float = 0.0, efficiency: float = 0.75) -> dict:
+    """V_req = A·(ET0·Kc·days − P_eff)/1000/η ؛ مازاد = مصرف واقعی − نیاز."""
+    if area_m2 <= 0 or not (0 < efficiency <= 1):
+        raise ValueError("مساحت باید مثبت و راندمان بین 0 و 1 باشد")
+    need_mm = max(et0_mm_day * kc * days - effective_rain_mm, 0.0)
+    req = area_m2 * need_mm / 1000.0 / efficiency
+    w: list[str] = []
+    out = {"required_m3": req, "excess_m3": actual_m3 - req,
+           "excess_pct": (actual_m3 - req) / req * 100 if req else None, "warnings": w}
+    _chk(req and actual_m3 > req * 1.25, "مصرف واقعی بیش از ۱۲۵٪ نیاز؛ زمان‌بندی/حسگر رطوبت و پساب تصفیه‌شده را بررسی کنید.", w)
+    return out

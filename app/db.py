@@ -147,6 +147,46 @@ CREATE TABLE IF NOT EXISTS audit_log(
   action TEXT NOT NULL, entity TEXT, entity_id TEXT, detail TEXT,
   at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+-- کاتالوگ مرجع (داده، نه کد): از طریق API قابل افزودن/ویرایش است
+CREATE TABLE IF NOT EXISTS industries(
+  code TEXT PRIMARY KEY, name TEXT NOT NULL, examples TEXT DEFAULT '',
+  subgroups TEXT DEFAULT '[]',          -- JSON: [[code,name],...]
+  typical_systems TEXT DEFAULT '[]',    -- JSON: [SYS-xx,...]
+  processes TEXT DEFAULT '[]',          -- JSON: فرآیندهای نوعی مصرف‌کننده آب
+  highlights TEXT DEFAULT '',           -- راهکارهای شاخص صنعت (سند)
+  measure_codes TEXT DEFAULT '[]',      -- JSON: کد راهکارهای مرتبط
+  source TEXT DEFAULT 'guide'
+);
+CREATE TABLE IF NOT EXISTS systems(
+  code TEXT PRIMARY KEY, name_fa TEXT NOT NULL, name_en TEXT DEFAULT '', category TEXT DEFAULT '',
+  equipment TEXT DEFAULT '[]', typical_in TEXT DEFAULT '[]', typical_out TEXT DEFAULT '[]',
+  measurements TEXT DEFAULT '[]', calc_module TEXT, kpis TEXT DEFAULT '[]', notes TEXT DEFAULT '',
+  source TEXT DEFAULT 'guide'
+);
+CREATE TABLE IF NOT EXISTS stream_types(
+  code TEXT PRIMARY KEY, name_en TEXT DEFAULT '', name_fa TEXT NOT NULL,
+  direction TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL,
+  definition TEXT DEFAULT '', quality_class TEXT DEFAULT '', allowed_use TEXT DEFAULT '',
+  origin TEXT DEFAULT '', destination TEXT DEFAULT '', recycle_status TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS source_categories(
+  code TEXT PRIMARY KEY, name TEXT NOT NULL, examples TEXT DEFAULT '', source TEXT DEFAULT 'doc'
+);
+CREATE TABLE IF NOT EXISTS equipment_types(
+  code TEXT PRIMARY KEY, name_fa TEXT NOT NULL, name_en TEXT DEFAULT '', system_code TEXT DEFAULT '',
+  source TEXT DEFAULT 'guide'           -- doc | guide | user
+);
+CREATE TABLE IF NOT EXISTS parameters(
+  code TEXT PRIMARY KEY, name TEXT NOT NULL, symbol TEXT DEFAULT '', unit TEXT DEFAULT '',
+  grp TEXT DEFAULT '', note TEXT DEFAULT '', source TEXT DEFAULT 'doc'
+);
+CREATE TABLE IF NOT EXISTS instruments(
+  code TEXT PRIMARY KEY, name_fa TEXT NOT NULL, name_en TEXT DEFAULT '', usage TEXT DEFAULT '', source TEXT DEFAULT 'doc'
+);
+CREATE TABLE IF NOT EXISTS system_formulas(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, system_code TEXT NOT NULL, name TEXT NOT NULL, formula TEXT NOT NULL,
+  source TEXT DEFAULT 'doc', UNIQUE(system_code, name)
+);
 CREATE INDEX IF NOT EXISTS ix_readings_period ON readings(period);
 CREATE INDEX IF NOT EXISTS ix_streams_site ON streams(site_id);
 """
@@ -173,9 +213,35 @@ def db():
         c.close()
 
 
+# ستون‌های افزوده‌شده در نسخه‌های بعدی؛ برای دیتابیس‌های قدیمی به‌صورت خودکار و بدون از دست رفتن داده اضافه می‌شوند
+MIGRATIONS = [
+    ("sites", "subgroup_code", "TEXT DEFAULT ''"),
+    ("streams", "stream_type", "TEXT DEFAULT ''"),        # کد نوع جریان (stream_types)
+    ("streams", "system_code", "TEXT DEFAULT ''"),        # سیستم مصرف‌کننده (SYS-xx)
+    ("streams", "source_category", "TEXT DEFAULT ''"),    # دسته منبع (SRC-xx) برای جریان‌های ورودی
+    ("streams", "origin", "TEXT DEFAULT ''"),
+    ("streams", "destination", "TEXT DEFAULT ''"),
+    ("streams", "quality_class", "TEXT DEFAULT ''"),
+    ("streams", "allowed_use", "TEXT DEFAULT ''"),
+    ("streams", "recycle_status", "TEXT DEFAULT ''"),
+    ("projects", "escalation", "REAL NOT NULL DEFAULT 0"),        # رشد سالانه هزینه آب (منفعت)
+    ("projects", "opex_escalation", "REAL NOT NULL DEFAULT 0"),   # رشد سالانه هزینه بهره‌برداری
+    ("projects", "salvage_value", "REAL NOT NULL DEFAULT 0"),
+    ("projects", "selected", "INTEGER NOT NULL DEFAULT 0"),       # عضویت در مجموعه راهکارهای منتخب
+]
+
+
+def migrate(c: sqlite3.Connection):
+    for table, col, decl in MIGRATIONS:
+        cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if cols and col not in cols:  # جدولی که هنوز نیست توسط SCHEMA ساخته می‌شود
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
 def init_db():
     with db() as c:
         c.executescript(SCHEMA)
+        migrate(c)
 
 
 def rows(cur) -> list[dict]:
