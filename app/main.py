@@ -18,7 +18,8 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import auth, services
+from . import auth, services, timeutil as tu, tsdata, meters as meters_mod
+from .api_ts import TS_ROUTES
 from .db import db, init_db, rows, one
 from .engine import equipment as eq
 from .engine.kpi import safe_eval, FormulaError
@@ -61,6 +62,7 @@ class SiteIn(BaseModel):
     cost_distribution: float = Field(0, ge=0)
     cost_disposal: float = Field(0, ge=0)
     screening_pct: float = Field(10, gt=0, le=100)
+    calendar: Literal["gregorian", "jalali"] = "gregorian"   # تقویم کلید دوره‌ها و پیش‌فرض ورود/نمایش تاریخ
 
 
 class UnitIn(BaseModel):
@@ -354,10 +356,10 @@ async def create_site(request: Request):
     with db() as c:
         check_industry(c, d.industry_code, d.subgroup_code)
         cur = c.execute("""INSERT INTO sites(name,industry_code,subgroup_code,location,product_unit,cost_supply,cost_pumping,
-            cost_treatment,cost_distribution,cost_disposal,screening_pct,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            cost_treatment,cost_distribution,cost_disposal,screening_pct,calendar,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (d.name, d.industry_code, d.subgroup_code, d.location, d.product_unit, d.cost_supply,
                          d.cost_pumping, d.cost_treatment, d.cost_distribution, d.cost_disposal, d.screening_pct,
-                         u["id"]))
+                         d.calendar, u["id"]))
     auth.log(u, "create", "site", cur.lastrowid, d.name)
     return ok({"id": cur.lastrowid}, 201)
 
@@ -382,10 +384,14 @@ async def update_site(request: Request):
     d = parse(SiteIn, await body(request))
     with db() as c:
         check_industry(c, d.industry_code, d.subgroup_code)
+        old_cal = tsdata.site_calendar(c, site_id)
         c.execute("""UPDATE sites SET name=?,industry_code=?,subgroup_code=?,location=?,product_unit=?,cost_supply=?,
             cost_pumping=?,cost_treatment=?,cost_distribution=?,cost_disposal=?,screening_pct=? WHERE id=?""",
                   (d.name, d.industry_code, d.subgroup_code, d.location, d.product_unit, d.cost_supply,
                    d.cost_pumping, d.cost_treatment, d.cost_distribution, d.cost_disposal, d.screening_pct, site_id))
+        if d.calendar != old_cal:  # کلید دوره‌ها (ماه‌های تقویم) عوض می‌شود؛ سطل‌ها از روی تاریخ‌های دقیق بازسازی می‌شوند
+            c.execute("UPDATE sites SET calendar=? WHERE id=?", (d.calendar, site_id))
+            tsdata.rebuild(c, site_id, None)
     auth.log(u, "update", "site", site_id)
     return ok({"ok": True})
 
@@ -395,6 +401,7 @@ def delete_site(request: Request):
     site_id = sid(request)
     get_site(site_id)
     with db() as c:
+        c.execute("DELETE FROM ts_buckets WHERE site_id=?", (site_id,))
         c.execute("DELETE FROM sites WHERE id=?", (site_id,))
     auth.log(u, "delete", "site", site_id)
     return ok({"ok": True})
@@ -485,23 +492,22 @@ def delete_stream(request: Request):
         cur = c.execute("DELETE FROM streams WHERE id=? AND site_id=?", (stid, site_id))
         if cur.rowcount == 0:
             raise HTTPException(404, "جریان یافت نشد")
+        c.execute("DELETE FROM ts_entries WHERE stream_id=? AND site_id=?", (stid, site_id))
+        c.execute("DELETE FROM ts_buckets WHERE stream_id=? AND site_id=?", (stid, site_id))
     auth.log(u, "delete", "stream", stid)
     return ok({"ok": True})
 
 
-def _upsert_reading(c, site_id: int, r: ReadingIn, user_id: int, source: str):
-    need_period(r.period)
-    if r.quality not in QUALITIES:
-        raise HTTPException(422, f"وضعیت داده باید یکی از {sorted(QUALITIES)} باشد")
-    st = one(c.execute("SELECT id FROM streams WHERE id=? AND site_id=?", (r.stream_id, site_id)))
-    if not st:
-        raise HTTPException(404, f"جریان {r.stream_id} در این مجتمع نیست")
-    c.execute("""INSERT INTO readings(stream_id,period,volume,corrected_volume,quality,source,entered_by)
-                 VALUES(?,?,?,?,?,?,?)
-                 ON CONFLICT(stream_id,period) DO UPDATE SET volume=excluded.volume,
-                   corrected_volume=excluded.corrected_volume, quality=excluded.quality,
-                   source=excluded.source, entered_by=excluded.entered_by, entered_at=CURRENT_TIMESTAMP""",
-              (r.stream_id, r.period, r.volume, r.corrected_volume, r.quality, source, user_id))
+def _legacy_save(site_id: int, items: list[dict], user_id: int):
+    """مسیر قدیمی ثبت ماهانه: همه‌یا‌هیچ؛ از لایه سری زمانی عبور می‌کند (تقویم گزارش‌گیری مجتمع)."""
+    try:
+        with db() as c:
+            res = tsdata.save_entries(site_id, items, "manual", user_id, None, False, c=c)
+            if res["errors"]:
+                raise tsdata.TsError(res["errors"][0]["error"])
+    except (tsdata.TsError, tu.DateError) as e:
+        msg = str(e)
+        raise HTTPException(404 if "تعریف نشده" in msg and "جریان" in msg else 422, msg)
 
 
 async def add_readings(request: Request):
@@ -513,9 +519,12 @@ async def add_readings(request: Request):
     if not items or len(items) > 5000:
         raise HTTPException(422, "فهرست readings خالی یا بیش از ۵۰۰۰ مورد است")
     parsed = [parse(ReadingIn, i) for i in items]
-    with db() as c:
-        for r in parsed:
-            _upsert_reading(c, site_id, r, u["id"], "manual")
+    for r in parsed:
+        need_period(r.period)
+        if r.quality not in QUALITIES:
+            raise HTTPException(422, f"وضعیت داده باید یکی از {sorted(QUALITIES)} باشد")
+    _legacy_save(site_id, [{"variable": "stream_volume", "stream_id": r.stream_id, "period": r.period, "value": r.volume,
+                            "quality": r.quality, "corrected_value": r.corrected_volume} for r in parsed], u["id"])
     auth.log(u, "upsert", "readings", site_id, f"{len(parsed)} rows")
     return ok({"saved": len(parsed)})
 
@@ -529,79 +538,18 @@ def list_readings(request: Request):
                                     WHERE s.site_id=? ORDER BY r.period DESC, s.name LIMIT 2000""", (site_id,))))
 
 
-def _decode(raw: bytes) -> str:
-    for enc in ("utf-8-sig", "cp1256"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    raise HTTPException(400, "کدگذاری فایل پشتیبانی نمی‌شود (UTF-8 یا Windows-1256)")
-
-
-async def import_csv(request: Request):
-    """CSV با ستون‌های: stream, period, volume, [quality]  یا  production: period, product_qty, ambient_temp, operating_hours."""
-    u = auth.require(request, "engineer")
-    site_id = sid(request)
-    get_site(site_id)
-    kind = request.query_params.get("type", "readings")
-    if kind not in ("readings", "production"):
-        raise HTTPException(422, "type باید readings یا production باشد")
-    form = await request.form()
-    f = form.get("file")
-    if f is None or not hasattr(f, "read"):
-        raise HTTPException(422, "فایل CSV ارسال نشده است")
-    raw = await f.read()
-    if len(raw) > MAX_UPLOAD:
-        raise HTTPException(413, "حجم فایل بیش از ۵ مگابایت است")
-    text = _decode(raw)
-    reader = csv.DictReader(io.StringIO(text))
-    errors, saved = [], 0
-    with db() as c:
-        names = {r["name"]: r["id"] for r in c.execute("SELECT id,name FROM streams WHERE site_id=?", (site_id,))}
-        for i, row in enumerate(reader, start=2):
-            try:
-                row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-                period = row.get("period", "")
-                need_period(period)
-                if kind == "readings":
-                    nm = row.get("stream", "")
-                    if nm not in names:
-                        raise ValueError(f"جریان «{nm}» تعریف نشده است")
-                    vol = float(row["volume"].replace(",", ""))
-                    r = ReadingIn(stream_id=names[nm], period=period, volume=vol, quality=row.get("quality") or "valid")
-                    _upsert_reading(c, site_id, r, u["id"], "csv")
-                else:
-                    p = ProductionIn(period=period, product_qty=float(row["product_qty"].replace(",", "")),
-                                     ambient_temp=float(row["ambient_temp"]) if row.get("ambient_temp") else None,
-                                     operating_hours=float(row["operating_hours"]) if row.get("operating_hours") else None)
-                    c.execute("""INSERT INTO production(site_id,period,product_qty,ambient_temp,operating_hours)
-                                 VALUES(?,?,?,?,?) ON CONFLICT(site_id,period) DO UPDATE SET
-                                 product_qty=excluded.product_qty, ambient_temp=excluded.ambient_temp,
-                                 operating_hours=excluded.operating_hours""",
-                              (site_id, p.period, p.product_qty, p.ambient_temp, p.operating_hours))
-                saved += 1
-            except HTTPException as e:
-                errors.append({"line": i, "error": e.detail})
-            except (ValueError, KeyError, ValidationError) as e:
-                errors.append({"line": i, "error": str(e) if not isinstance(e, KeyError) else f"ستون {e} موجود نیست"})
-            if len(errors) > 100:
-                errors.append({"line": i, "error": "تعداد خطاها زیاد است؛ ادامه داده نشد"})
-                break
-    auth.log(u, "import_csv", kind, site_id, f"saved={saved} errors={len(errors)}")
-    return ok({"saved": saved, "errors": errors}, 200 if saved or not errors else 422)
-
-
 async def add_production(request: Request):
     u = auth.require(request, "engineer")
     site_id = sid(request)
     get_site(site_id)
     p = parse(ProductionIn, await body(request))
     need_period(p.period)
-    with db() as c:
-        c.execute("""INSERT INTO production(site_id,period,product_qty,ambient_temp,operating_hours) VALUES(?,?,?,?,?)
-                     ON CONFLICT(site_id,period) DO UPDATE SET product_qty=excluded.product_qty,
-                     ambient_temp=excluded.ambient_temp, operating_hours=excluded.operating_hours""",
-                  (site_id, p.period, p.product_qty, p.ambient_temp, p.operating_hours))
+    items = [{"variable": "production", "period": p.period, "value": p.product_qty}]
+    if p.ambient_temp is not None:
+        items.append({"variable": "ambient_temp", "period": p.period, "value": p.ambient_temp})
+    if p.operating_hours is not None:
+        items.append({"variable": "operating_hours", "period": p.period, "value": p.operating_hours})
+    _legacy_save(site_id, items, u["id"])
     auth.log(u, "upsert", "production", site_id, p.period)
     return ok({"ok": True})
 
@@ -618,13 +566,11 @@ async def add_storage(request: Request):
     u = auth.require(request, "engineer")
     site_id = sid(request)
     get_site(site_id)
-    s = parse(StorageIn, await body(request))
-    need_period(s.period)
-    with db() as c:
-        c.execute("""INSERT INTO storage_changes(site_id,period,delta_volume,uncertainty) VALUES(?,?,?,?)
-                     ON CONFLICT(site_id,period) DO UPDATE SET delta_volume=excluded.delta_volume,
-                     uncertainty=excluded.uncertainty""", (site_id, s.period, s.delta_volume, s.uncertainty))
-    auth.log(u, "upsert", "storage", site_id, s.period)
+    st = parse(StorageIn, await body(request))
+    need_period(st.period)
+    _legacy_save(site_id, [{"variable": "storage_delta", "period": st.period, "value": st.delta_volume,
+                            "uncertainty": st.uncertainty}], u["id"])
+    auth.log(u, "upsert", "storage", site_id, st.period)
     return ok({"ok": True})
 
 
@@ -974,7 +920,7 @@ async def upsert_kpi_def(request: Request):
     u = auth.require(request, "engineer")
     d = parse(KpiDefIn, await body(request))
     try:  # اعتبارسنجی فرمول: فقط متغیرهای شناخته‌شده سیستم مجازند
-        safe_eval(d.formula, {n: 1.0 for n in services.KPI_VAR_NAMES})
+        safe_eval(d.formula, {n: 1.0 for n in services.kpi_var_names()})
     except FormulaError as e:
         if "تقسیم بر صفر" not in str(e):
             raise HTTPException(422, f"فرمول نامعتبر: {e}")
@@ -1146,6 +1092,7 @@ def index(request: Request):
 # ---------------------------------------------------------------- مسیرها
 S = "/api/sites/{site_id:int}"
 routes = [
+    *TS_ROUTES,
     Route("/", index),
     Route("/api/health", health),
     Route("/favicon.ico", favicon),
@@ -1166,7 +1113,6 @@ routes = [
     Route(S + "/streams/{stream_id:int}", delete_stream, methods=["DELETE"]),
     Route(S + "/readings", list_readings),
     Route(S + "/readings", add_readings, methods=["POST"]),
-    Route(S + "/import", import_csv, methods=["POST"]),
     Route(S + "/production", list_production),
     Route(S + "/production", add_production, methods=["POST"]),
     Route(S + "/storage", add_storage, methods=["POST"]),
@@ -1223,7 +1169,15 @@ async def lifespan(app):
     init_db()
     from .seed import seed_all
     seed_all()
-    yield
+    poller = None
+    if os.environ.get("AQUA_NO_POLLER") != "1":
+        poller = meters_mod.Poller()
+        poller.start()
+    try:
+        yield
+    finally:
+        if poller:
+            poller.stop()
 
 
 app = Starlette(routes=routes, lifespan=lifespan,

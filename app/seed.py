@@ -11,7 +11,7 @@ import secrets
 from . import auth
 from .db import DATA_DIR, db, one
 from .engine.kpi import DEFAULT_KPIS
-from . import catalog
+from . import catalog, tsdata
 import json
 
 GEN = "مبنای عمومی مهندسی؛ نیازمند راستی‌آزمایی در سایت"
@@ -335,8 +335,10 @@ def seed_demo():
 
 def seed_all():
     seed_catalog()
+    tsdata.seed_variables()
     seed_kpis()
     seed_measures()
     seed_admin()
     if os.environ.get("AQUA_DEMO", "1") == "1":
         seed_demo()
+    tsdata.backfill_all()   # داده‌های ماهانه قدیمی/نمونه → ts_entries (یک‌بار برای هر مجتمع)

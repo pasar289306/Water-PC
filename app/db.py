@@ -187,6 +187,66 @@ CREATE TABLE IF NOT EXISTS system_formulas(
   id INTEGER PRIMARY KEY AUTOINCREMENT, system_code TEXT NOT NULL, name TEXT NOT NULL, formula TEXT NOT NULL,
   source TEXT DEFAULT 'doc', UNIQUE(system_code, name)
 );
+-- ===== لایه سری زمانی (منبع حقیقت: ts_entries با تاریخ دقیق میلادی؛ جداول ماهانه قدیمی/ts_buckets مشتق‌شده‌اند) =====
+CREATE TABLE IF NOT EXISTS variables(
+  code TEXT PRIMARY KEY, name_fa TEXT NOT NULL, unit TEXT DEFAULT '',
+  agg TEXT NOT NULL DEFAULT 'sum' CHECK(agg IN ('sum','mean')),      -- sum: جمع‌پذیر (حجم، تولید)؛ mean: میانگین وزنی (دما، EC)
+  entity TEXT NOT NULL DEFAULT 'site' CHECK(entity IN ('site','stream')),
+  nonneg INTEGER NOT NULL DEFAULT 1,                                  -- ۱: مقدار منفی مجاز نیست
+  grp TEXT DEFAULT '', note TEXT DEFAULT '', source TEXT DEFAULT 'builtin'
+);
+CREATE TABLE IF NOT EXISTS meters(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  stream_id INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+  code TEXT NOT NULL, name TEXT DEFAULT '',
+  meter_type TEXT DEFAULT 'other',               -- کد از instruments یا other
+  connection TEXT NOT NULL DEFAULT 'manual' CHECK(connection IN ('manual','api','direct')),
+  multiplier REAL NOT NULL DEFAULT 1,            -- ضریب تبدیل مقدار خام به m³
+  uncertainty_pct REAL NOT NULL DEFAULT 2.0,
+  serial TEXT DEFAULT '', location TEXT DEFAULT '', installed_at TEXT DEFAULT '', notes TEXT DEFAULT '',
+  config TEXT NOT NULL DEFAULT '{}',             -- JSON تنظیم اتصال مستقیم (پروتکل، آدرس، ثبات، ...)
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_poll_at TEXT, last_status TEXT DEFAULT '', last_raw REAL,
+  UNIQUE(site_id, code)
+);
+CREATE TABLE IF NOT EXISTS meter_reads(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  meter_id INTEGER NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
+  ts REAL NOT NULL,                               -- epoch ثانیه (UTC)
+  raw REAL NOT NULL,                              -- مقدار خام کنتور (شمارنده تجمعی یا دبی لحظه‌ای)
+  UNIQUE(meter_id, ts)
+);
+CREATE TABLE IF NOT EXISTS ts_entries(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  variable TEXT NOT NULL,
+  stream_id INTEGER NOT NULL DEFAULT 0,           -- 0 = متغیر سطح مجتمع
+  meter_id INTEGER NOT NULL DEFAULT 0,            -- 0 = ثبت در سطح جریان (بدون کنتور مشخص)
+  start_date TEXT NOT NULL, end_date TEXT NOT NULL,   -- ISO میلادی، هر دو سر شامل
+  granularity TEXT NOT NULL DEFAULT 'month' CHECK(granularity IN ('year','month','day','custom')),
+  value REAL NOT NULL, corrected_value REAL, uncertainty REAL DEFAULT 0,
+  quality TEXT NOT NULL DEFAULT 'valid' CHECK(quality IN ('valid','estimated','suspect','invalid','missing')),
+  source TEXT NOT NULL DEFAULT 'manual',          -- manual | excel | csv | api | meter | legacy
+  note TEXT DEFAULT '', entered_by INTEGER, entered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(site_id, variable, stream_id, meter_id, start_date, end_date)
+);
+CREATE INDEX IF NOT EXISTS ix_ts_series ON ts_entries(site_id, variable, stream_id, meter_id, start_date);
+CREATE TABLE IF NOT EXISTS ts_buckets(
+  site_id INTEGER NOT NULL, variable TEXT NOT NULL, stream_id INTEGER NOT NULL DEFAULT 0, meter_id INTEGER NOT NULL DEFAULT 0,
+  period TEXT NOT NULL,                           -- YYYY-MM در تقویم گزارش‌گیری مجتمع
+  value REAL NOT NULL, corrected REAL, uncertainty REAL DEFAULT 0,
+  coverage REAL NOT NULL DEFAULT 1, n INTEGER NOT NULL DEFAULT 1,
+  quality TEXT NOT NULL DEFAULT 'valid', source TEXT DEFAULT 'manual',
+  PRIMARY KEY(site_id, variable, stream_id, meter_id, period)
+);
+CREATE TABLE IF NOT EXISTS api_keys(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+  created_by INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_used_at TEXT, revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS ix_readings_period ON readings(period);
 CREATE INDEX IF NOT EXISTS ix_streams_site ON streams(site_id);
 """
@@ -228,6 +288,8 @@ MIGRATIONS = [
     ("projects", "opex_escalation", "REAL NOT NULL DEFAULT 0"),   # رشد سالانه هزینه بهره‌برداری
     ("projects", "salvage_value", "REAL NOT NULL DEFAULT 0"),
     ("projects", "selected", "INTEGER NOT NULL DEFAULT 0"),       # عضویت در مجموعه راهکارهای منتخب
+    ("sites", "calendar", "TEXT DEFAULT 'gregorian'"),            # تقویم کلید دوره‌ها (gregorian | jalali)
+    ("readings", "coverage", "REAL DEFAULT 1"),                   # نسبت پوشش روزهای دوره با داده (۰..۱)
 ]
 
 

@@ -13,6 +13,14 @@ KPI_VAR_NAMES = ["input", "freshwater", "accounted", "wastewater", "evaporation"
                  "reused", "total_use", "consumed", "beneficial", "production", "supply", "pumping",
                  "treatment", "distribution", "disposal"]
 FRESH_KINDS = {"raw", "potable", "fresh"}
+
+
+def kpi_var_names() -> list[str]:
+    """نام متغیرهای مجاز در فرمول شاخص‌ها: ثابت‌ها + متغیرهای سری زمانی سطح مجتمع."""
+    with db() as c:
+        extra = [r["code"] for r in c.execute(
+            "SELECT code FROM variables WHERE entity='site' AND code NOT IN ('production','storage_delta')")]
+    return KPI_VAR_NAMES + [x for x in extra if x not in KPI_VAR_NAMES]
 # فقط این جریان‌های داخلی «بازچرخانی/استفاده مجدد» محسوب می‌شوند؛ سایر جریان‌های داخلی (آب فرآیندی، خنک‌کاری، …)
 # صرفاً حسابداری سطح سیستم‌اند و نباید نرخ بازچرخانی را باد کنند (سند ۴.۴).
 REUSE_KINDS = {"reclaimed", "recycled", "condensate"}
@@ -35,12 +43,31 @@ def stream_totals(site_id: int, period: str | None = None) -> list[dict]:
                COUNT(r.id) AS n,
                SUM(CASE WHEN r.quality IN ('invalid','missing') THEN 1 ELSE 0 END) AS n_bad,
                SUM(CASE WHEN r.quality='suspect' THEN 1 ELSE 0 END) AS n_suspect,
-               SUM(CASE WHEN r.quality='estimated' THEN 1 ELSE 0 END) AS n_est
+               SUM(CASE WHEN r.quality='estimated' THEN 1 ELSE 0 END) AS n_est,
+               MIN(r.coverage) AS min_cov
         FROM streams s LEFT JOIN readings r
           ON r.stream_id=s.id AND r.quality NOT IN ('invalid','missing') {clause}
         LEFT JOIN units u ON u.id=s.unit_id
         WHERE s.site_id=? GROUP BY s.id ORDER BY s.id"""
-        return rows(c.execute(q, (*args, site_id)))
+        out = rows(c.execute(q, (*args, site_id)))
+        # عدم قطعیت مؤثر جریانی که چند کنتور دارد: هر کنتور خطای سیستماتیک خود را دارد → ترکیب مربعی وزن‌دار با حجم هر کنتور
+        bclause = clause.replace("r.period", "b.period")
+        mrows = rows(c.execute(f"""SELECT b.stream_id, b.meter_id, SUM(COALESCE(b.corrected,b.value)) v, m.uncertainty_pct pct
+            FROM ts_buckets b LEFT JOIN meters m ON m.id=b.meter_id
+            WHERE b.site_id=? AND b.variable='stream_volume' AND b.quality NOT IN ('invalid','missing') {bclause}
+            GROUP BY b.stream_id, b.meter_id""", (site_id, *args)))
+    by: dict[int, list] = {}
+    for m in mrows:
+        by.setdefault(m["stream_id"], []).append(m)
+    for t in out:
+        ms = by.get(t["id"], [])
+        t["n_meters"] = len({m["meter_id"] for m in ms if m["meter_id"]})
+        if t["n_meters"]:
+            tot = sum(m["v"] for m in ms)
+            if tot > 0:
+                u2 = sum(((m["pct"] if m["meter_id"] else t["uncertainty_pct"]) / 100.0 * m["v"]) ** 2 for m in ms)
+                t["uncertainty_pct"] = 100.0 * (u2 ** 0.5) / tot
+    return out
 
 
 def site_balance(site_id: int, period: str | None = None) -> dict:
@@ -62,6 +89,16 @@ def site_balance(site_id: int, period: str | None = None) -> dict:
                        "volume": t["volume"], "readings": t["n"], "bad": t["n_bad"] or 0,
                        "suspect": t["n_suspect"] or 0} for t in ts]
     res["period"] = period or "all"
+    # هشدار پوشش داده: ماه ناقص، یا جریان‌هایی که پوشش متفاوت دارند (موازنه فقط وقتی معنادار است که همه بازه یکسانی را بپوشانند)
+    partial = [t["name"] for t in ts if t.get("min_cov") is not None and t["min_cov"] < 0.999]
+    if partial:
+        res["warnings"].append("پوشش داده ناقص (بخشی از روزهای دوره بدون داده) برای: " + "، ".join(partial)
+                               + "؛ مجموع‌ها کمتر از مقدار واقعی‌اند و موازنه با احتیاط تفسیر شود.")
+    covs = {round(t["min_cov"], 2) for t in ts if t.get("min_cov") is not None and t["volume"] > 0}
+    if len(covs) > 1:
+        res["warnings"].append("جریان‌ها پوشش زمانی یکسان ندارند؛ باقیمانده موازنه می‌تواند ناشی از اختلاف بازه‌های داده باشد.")
+    metered = sum(t.get("n_meters", 0) for t in ts)
+    res["meters"] = metered
     return res
 
 
@@ -87,7 +124,8 @@ def kpi_variables(site_id: int, period: str | None = None) -> dict:
             p = one(c.execute("SELECT COALESCE(SUM(product_qty),0) q FROM production WHERE site_id=?", (site_id,)))
     reused = vol([t for t in internal if t["kind"] in REUSE_KINDS])
     residual = inp - accounted
-    return {
+    extra = site_series_variables(site_id, period)
+    return {**extra,
         "input": inp, "freshwater": vol([t for t in ins if t["kind"] in FRESH_KINDS]),
         "accounted": accounted, "wastewater": wastewater, "evaporation": evaporation,
         "product_water": product, "leakage": leakage, "reused": reused,
@@ -97,6 +135,21 @@ def kpi_variables(site_id: int, period: str | None = None) -> dict:
         "supply": site["cost_supply"], "pumping": site["cost_pumping"], "treatment": site["cost_treatment"],
         "distribution": site["cost_distribution"], "disposal": site["cost_disposal"],
     }
+
+
+def site_series_variables(site_id: int, period: str | None = None) -> dict:
+    """متغیرهای سری زمانی سطح مجتمع (انرژی، بارندگی، ET₀، تعداد افراد، متغیرهای کاربر، ...) برای فرمول شاخص‌ها:
+    جمع‌پذیر (sum) → مجموع دوره؛ میانگینی (mean) → میانگین ماهانه‌ی دوره. نام متغیر همان code آن است."""
+    cl, args = ("AND b.period LIKE ?", (period + "%",)) if period else ("", ())
+    out: dict[str, float] = {}
+    with db() as c:
+        vs = rows(c.execute("SELECT code, agg FROM variables WHERE entity='site' AND code NOT IN ('production','storage_delta')"))
+        for v in vs:
+            r = one(c.execute(f"""SELECT SUM(b.value) s, AVG(b.value) a, COUNT(*) n FROM ts_buckets b
+                WHERE b.site_id=? AND b.variable=? AND b.stream_id=0 AND b.quality NOT IN ('invalid','missing') {cl}""",
+                              (site_id, v["code"], *args)))
+            out[v["code"]] = float((r["s"] if v["agg"] == "sum" else r["a"]) or 0.0) if r and r["n"] else 0.0
+    return out
 
 
 def site_kpis(site_id: int, period: str | None = None) -> list[dict]:
@@ -229,11 +282,21 @@ def ranking(site_id: int, weights: dict | None = None) -> list[dict]:
 
 def baseline_analysis(site_id: int, split_period: str, predictors: list[str]) -> dict:
     """خط مبنا از داده‌های پیش از split_period؛ صرفه‌جویی دوره پس از آن (تعدیل‌شده)."""
-    allowed = {"product_qty", "ambient_temp", "operating_hours"}
+    legacy = {"product_qty", "ambient_temp", "operating_hours"}
+    with db() as c:
+        site_vars = {r["code"] for r in c.execute(
+            "SELECT code FROM variables WHERE entity='site' AND code NOT IN ('production','storage_delta')")}
+    allowed = legacy | site_vars
     if not predictors or any(p not in allowed for p in predictors):
         raise ValueError(f"پیش‌بینی‌کننده‌ها باید از {sorted(allowed)} باشند")
     with db() as c:
         prod = rows(c.execute("SELECT * FROM production WHERE site_id=? ORDER BY period", (site_id,)))
+        for k in set(predictors) - legacy:  # متغیرهای سری زمانی دیگر (انرژی، بارندگی، ...) از سطل‌های ماهانه
+            bk = {b["period"]: b["value"] for b in c.execute(
+                "SELECT period, value FROM ts_buckets WHERE site_id=? AND variable=? AND stream_id=0 AND quality NOT IN ('invalid','missing')",
+                (site_id, k))}
+            for p in prod:
+                p[k] = bk.get(p["period"])
         water = {r["period"]: r["w"] for r in c.execute("""
             SELECT r.period, SUM(COALESCE(r.corrected_volume, r.volume)) w FROM readings r
             JOIN streams s ON s.id=r.stream_id

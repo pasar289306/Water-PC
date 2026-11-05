@@ -7,6 +7,7 @@ os.environ["AQUA_DB"] = os.path.join(_tmp, "test.db")
 os.environ["AQUA_ADMIN_PASSWORD"] = "AdminPass123"
 os.environ["AQUA_SECRET"] = "test-secret-key-for-unit-tests-only-0123456789"
 os.environ["AQUA_DEMO"] = "1"
+os.environ["AQUA_NO_POLLER"] = "1"
 
 import pytest
 from starlette.testclient import TestClient
