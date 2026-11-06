@@ -42,7 +42,7 @@ async function api(path, opt = {}) {
   if (r.status === 401 && !path.includes("/auth/login")) { logout(); throw new Error("نشست منقضی شد؛ دوباره وارد شوید"); }
   if (opt.raw) { if (!r.ok) throw new Error("خطا در دریافت"); return r; }
   let data = null; try { data = await r.json(); } catch { /* بدنه خالی */ }
-  if (!r.ok) throw new Error((data && data.detail) || "خطای ناشناخته (" + r.status + ")");
+  if (!r.ok) { const err = new Error((data && data.detail) || "خطای ناشناخته (" + r.status + ")"); err.data = data; throw err; }
   return data;
 }
 function toast(msg, bad = false) {
@@ -299,6 +299,7 @@ async function structureMain(v) {
     <label>هزینه توزیع<input name="cost_distribution" type="number" min="0" step="any" value="${s?.cost_distribution ?? 0}" ${dis}></label>
     <label>هزینه دفع<input name="cost_disposal" type="number" min="0" step="any" value="${s?.cost_disposal ?? 0}" ${dis}></label>
     <label>آستانه غربالگری موازنه (٪)<input name="screening_pct" type="number" min="0.1" max="100" step="any" value="${s?.screening_pct ?? 10}" ${dis}></label>
+    <label>تقویم گزارش‌گیری (کلید دوره‌ها)<select name="calendar" ${dis}><option value="gregorian" ${(s?.calendar || "gregorian") === "gregorian" ? "selected" : ""}>میلادی</option><option value="jalali" ${s?.calendar === "jalali" ? "selected" : ""}>شمسی</option></select></label>
     ${canEdit() ? html`<div><button class="btn primary" name="act" value="${s ? "update" : "create"}">${s ? "ذخیره تغییرات" : "ایجاد مجتمع"}</button>
       ${s ? html` <button type="button" class="btn" data-act="newsite">مجتمع جدید</button>` : ""}
       ${s && state.user.role === "admin" ? html` <button type="button" class="btn danger" data-act="delsite">حذف</button>` : ""}</div>` : ""}
@@ -403,47 +404,350 @@ VIEWS.catalog = async v => {
   v.innerHTML = html`<div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.8rem">${tabs.map(([k, t]) => html`<button class="btn small ${k === tab ? "primary" : ""}" data-act="cattab" data-id="${k}">${t}</button>`)}</div>${body}`.__raw;
 };
 
+// ================= ورود داده (سری‌های زمانی؛ چهار روش ورود) =================
+const DATA_TABS = [["manual", "ثبت دستی"], ["file", "فایل Excel / CSV"], ["api", "اتصال API"], ["meters", "کنتورها و اتصال مستقیم"],
+  ["list", "فهرست و ویرایش داده‌ها"], ["vars", "متغیرها و پوشش داده"]];
+const GRAN_FA = { year: "سالانه", month: "ماهانه", day: "روزانه", custom: "بازه دلخواه" };
+const SRC_FA = { manual: "دستی", excel: "Excel", csv: "CSV", api: "API", meter: "کنتور", legacy: "قبلی", mixed: "ترکیبی" };
+const CONN_FA = { manual: "دستی / فایل", api: "API (ارسال از سامانه بیرونی)", direct: "اتصال مستقیم (Modbus / HTTP)" };
+const CAL_FA = { gregorian: "میلادی", jalali: "شمسی" };
+const calOf = () => { let c = VIEWS.data.cal; if (!c) { try { c = localStorage.getItem("aq_cal"); } catch { /* ممنوع */ } } return c || (site() && site().calendar) || "gregorian"; };
+const setCal = c => { VIEWS.data.cal = c; try { localStorage.setItem("aq_cal", c); } catch { /* ممنوع */ } };
+const calSelect = (name, cal) => html`<select name="${name}">${Object.entries(CAL_FA).map(([k, t]) => html`<option value="${k}" ${k === cal ? "selected" : ""}>${t}</option>`)}</select>`;
+
+function dtField(name, iso, cal) {
+  const p = iso ? fromISO(cal, iso) : { y: "", m: 1, d: "" }; const names = cal === "jalali" ? JMONTHS : GMONTHS;
+  return html`<span class="dt" data-name="${name}" data-cal="${cal}" dir="ltr">
+    <input class="dy" type="number" min="1" step="1" value="${p.y}" placeholder="${cal === "jalali" ? "1404" : "2025"}" aria-label="سال">
+    <select class="dm" aria-label="ماه">${names.map((n, i) => html`<option value="${i + 1}" ${p.m === i + 1 ? "selected" : ""}>${i + 1} · ${n}</option>`)}</select>
+    <input class="dd" type="number" min="1" max="31" step="1" value="${p.d}" placeholder="روز" aria-label="روز"></span>`;
+}
+const dtISO = sp => toISO(sp.dataset.cal, sp.querySelector(".dy").value, sp.querySelector(".dm").value, sp.querySelector(".dd").value);
+function convertDates(root, cal) {
+  root.querySelectorAll(".dt").forEach(sp => {
+    const iso = dtISO(sp); sp.dataset.cal = cal; const names = cal === "jalali" ? JMONTHS : GMONTHS;
+    const m = sp.querySelector(".dm"); const cur = +m.value;
+    m.innerHTML = names.map((n, i) => `<option value="${i + 1}">${i + 1} · ${esc(n)}</option>`).join("");
+    sp.querySelector(".dy").placeholder = cal === "jalali" ? "1404" : "2025";
+    if (iso) { const p = fromISO(cal, iso); sp.querySelector(".dy").value = p.y; m.value = p.m; sp.querySelector(".dd").value = p.d; } else m.value = cur;
+  });
+}
+const defaultRange = cal => { const t = todayISO(); const p = fromISO(cal, t); return [toISO(cal, p.y, 1, 1), t]; };
+
 VIEWS.data = async v => {
-  const id = state.siteId;
-  const [streams, readings, prod] = await Promise.all([api(`/api/sites/${id}/streams`), api(`/api/sites/${id}/readings`), api(`/api/sites/${id}/production`)]);
-  const ro = !canEdit();
-  v.innerHTML = html`
-  <h2>ورود داده</h2>
-  ${ro ? html`<p class="note">نقش شما فقط مشاهده است.</p>` : html`
-  <div class="grid g2">
-   <div class="card"><h3>ثبت قرائت ماهانه</h3>
-    <form data-form="reading" class="form">
-     <label>جریان<select name="stream_id">${streams.map(s => html`<option value="${s.id}">${s.name} (${s.direction === "in" ? "ورودی" : "خروجی"})</option>`)}</select></label>
-     <label>دوره (YYYY-MM)<input name="period" required pattern="\\d{4}-(0[1-9]|1[0-2])" placeholder="2025-03" dir="ltr"></label>
-     <label>حجم (m³)<input name="volume" type="number" step="any" min="0" required></label>
-     <label>وضعیت داده<select name="quality">${Object.entries(QUAL_FA).map(([k, t]) => html`<option value="${k}">${t}</option>`)}</select></label>
-     <label>حجم اصلاح‌شده (اختیاری)<input name="corrected_volume" type="number" step="any" min="0"></label>
-     <button class="btn primary">ثبت</button></form></div>
-   <div class="card"><h3>داده تولید ماهانه</h3>
-    <form data-form="production" class="form">
-     <label>دوره<input name="period" required pattern="\\d{4}-(0[1-9]|1[0-2])" placeholder="2025-03" dir="ltr"></label>
-     <label>مقدار تولید<input name="product_qty" type="number" step="any" min="0" required></label>
-     <label>دمای محیط (°C)<input name="ambient_temp" type="number" step="any"></label>
-     <label>ساعات کارکرد<input name="operating_hours" type="number" step="any" min="0"></label>
-     <button class="btn primary">ثبت</button></form>
-    <h3 style="margin-top:1rem">تغییر موجودی مخازن</h3>
-    <form data-form="storage" class="form">
-     <label>دوره<input name="period" required placeholder="2025-03" dir="ltr"></label>
-     <label>ΔV (m³، مثبت = افزایش)<input name="delta_volume" type="number" step="any" required></label>
-     <label>عدم قطعیت (m³)<input name="uncertainty" type="number" step="any" min="0" value="0"></label>
-     <button class="btn">ثبت</button></form></div>
-  </div>
-  <div class="card"><h3>ورود گروهی از فایل CSV</h3>
-   <form data-form="csv" class="form">
-    <label>نوع<select name="type"><option value="readings">قرائت‌ها: stream,period,volume,quality</option><option value="production">تولید: period,product_qty,ambient_temp,operating_hours</option></select></label>
-    <label>فایل CSV (حداکثر ۵MB)<input type="file" name="file" accept=".csv,text/csv" required></label>
-    <button class="btn primary">بارگذاری</button></form>
-   <div id="csvResult"></div></div>`}
-  <div class="grid g2">
-  <div class="card"><h3>آخرین قرائت‌ها</h3><div class="tablewrap" style="max-height:340px"><table><tr><th>دوره</th><th>جریان</th><th>حجم</th><th>وضعیت</th><th>منبع</th></tr>
-   ${readings.slice(0, 300).map(r => html`<tr><td>${r.period}</td><td>${r.stream_name}</td><td class="num">${fmt(r.corrected_volume ?? r.volume, 1)}</td><td>${QUAL_FA[r.quality]}</td><td>${r.source}</td></tr>`)}</table></div></div>
-  <div class="card"><h3>تولید</h3><div class="tablewrap" style="max-height:340px"><table><tr><th>دوره</th><th>تولید</th><th>دما</th><th>ساعات</th></tr>
-   ${prod.map(p => html`<tr><td>${p.period}</td><td class="num">${fmt(p.product_qty, 1)}</td><td class="num">${fmt(p.ambient_temp)}</td><td class="num">${fmt(p.operating_hours)}</td></tr>`)}</table></div></div></div>`.__raw;
+  const id = state.siteId, tab = VIEWS.data.tab || "manual", ro = !canEdit();
+  const tabs = html`<div class="subtabs">${DATA_TABS.map(([k, t]) => html`<button class="btn ${k === tab ? "primary" : ""}" data-act="datatab" data-id="${k}">${t}</button>`)}</div>`;
+  const [streams, vars, meters] = await Promise.all([api(`/api/sites/${id}/streams`), api("/api/variables"), api(`/api/sites/${id}/meters`)]);
+  VIEWS.data.ctx = { streams, vars, meters };
+  const body = await DATA_RENDER[tab](streams, vars, meters, ro);
+  v.innerHTML = html`<h2>ورود داده</h2>${tabs}${body}`.__raw;
+  if (tab === "manual") refreshCtl($("form[data-form=tsctl]"));
+  if (tab === "meters") refreshMeterForm($("form[data-form=meter]"));
+};
+
+const varMeta = code => (VIEWS.data.ctx?.vars || []).find(x => x.code === code);
+function varOptions(vars, sel) {
+  const groups = { water: "آب", production: "تولید", weather: "آب‌وهوا", energy: "انرژی", sanitary: "بهداشتی", custom: "متغیرهای کاربر" };
+  const g = {}; for (const x of vars) { const k = x.grp.startsWith("quality") ? "quality" : (groups[x.grp] ? x.grp : "custom"); (g[k] = g[k] || []).push(x); }
+  const names = { ...groups, quality: "پارامترهای کیفی جریان" };
+  return Object.entries(g).map(([k, xs]) => html`<optgroup label="${names[k]}">${xs.map(x => html`<option value="${x.code}" ${x.code === sel ? "selected" : ""}>${x.name_fa} (${x.unit || "—"}) · ${x.agg === "sum" ? "جمع‌پذیر" : "میانگین"}</option>`)}</optgroup>`);
+}
+
+const DATA_RENDER = {
+  async manual(streams, vars, meters, ro) {
+    if (ro) return html`<p class="note">نقش شما فقط مشاهده است.</p>`;
+    const cal = calOf(), [s0, e0] = defaultRange(cal);
+    return html`<div class="card"><h3>۱) تعیین متغیر، تقویم و بازه</h3>
+    <p class="muted small">دانه‌بندی (سالانه، ماهانه، روزانه یا بازه دلخواه) و بازه زمانی را خودتان انتخاب می‌کنید؛ سپس جدول دوره‌ها ساخته می‌شود و مقادیر را وارد می‌کنید. می‌توانید ستونی از اکسل را در اولین خانه Paste کنید.</p>
+    <form data-form="tsctl" class="form">
+      <label>متغیر<select name="variable">${varOptions(vars, "stream_volume")}</select></label>
+      <label data-show="stream">جریان (منبع/مصرف)<select name="stream_id">${streams.map(s => html`<option value="${s.id}">${s.name} (${s.direction === "in" ? "ورودی" : "خروجی"})</option>`)}</select></label>
+      <label data-show="meter">کنتور<select name="meter_id"><option value="">— کل جریان (بدون تفکیک کنتور) —</option>${meters.map(m => html`<option value="${m.id}" data-stream="${m.stream_id}">${m.code}${m.name ? " – " + m.name : ""}</option>`)}</select></label>
+      <label>تقویم تاریخ‌ها${calSelect("calendar", cal)}</label>
+      <label>دانه‌بندی<select name="granularity">${Object.entries(GRAN_FA).map(([k, t]) => html`<option value="${k}" ${k === "month" ? "selected" : ""}>${t}</option>`)}</select></label>
+      <label data-show="custom">طول هر دوره (روز) — خالی = یک دوره برای کل بازه<input name="step_days" type="number" min="1" step="1"></label>
+      <label>از تاریخ ${dtField("start", s0, cal)}</label>
+      <label>تا تاریخ ${dtField("end", e0, cal)}</label>
+      <div><button class="btn primary">ساخت جدول دوره‌ها</button></div></form></div>
+    <div class="card" id="gridCard" hidden><h3>۲) مقادیر</h3><div id="grid"></div><div id="gridOut"></div></div>`;
+  },
+  async file(streams, vars, meters, ro) {
+    if (ro) return html`<p class="note">نقش شما فقط مشاهده است.</p>`;
+    const cal = calOf();
+    return html`<div class="card"><h3>بارگذاری فایل Excel (.xlsx) یا CSV</h3>
+    <form data-form="file" class="form">
+      <label>قالب فایل<select name="type">
+        <option value="entries">جدول بلند: variable, stream, meter, start, end, value, quality</option>
+        <option value="wide">جدول عریض: ستون اول تاریخ، سایر ستون‌ها = کد کنتور / نام جریان / کد متغیر</option>
+        <option value="readings">قرائت ماهانه جریان: stream, period, volume, quality</option>
+        <option value="production">تولید ماهانه: period, product_qty, ambient_temp, operating_hours</option></select></label>
+      <label>تقویم تاریخ‌های داخل فایل${calSelect("calendar", cal)}</label>
+      <label>فایل (حداکثر ۵MB)<input type="file" name="file" accept=".xlsx,.xlsm,.csv,text/csv" required></label>
+      <label class="chk"><input type="checkbox" name="replace" value="1"> جایگزینی داده‌های هم‌پوشان</label>
+      <div><button class="btn primary">بارگذاری</button></div></form>
+    <p class="small muted" style="margin-top:.6rem">قالب نمونه (بر پایه جریان‌ها و کنتورهای همین مجتمع و تقویم انتخابی):
+      <button type="button" class="btn small" data-act="tpl" data-layout="long" data-format="xlsx">جدول بلند (xlsx)</button>
+      <button type="button" class="btn small" data-act="tpl" data-layout="wide" data-format="xlsx">جدول عریض (xlsx)</button>
+      <button type="button" class="btn small" data-act="tpl" data-layout="long" data-format="csv">جدول بلند (csv)</button></p>
+    <ul class="small muted"><li>تاریخ‌ها می‌توانند شمسی یا میلادی باشند (ارقام فارسی هم مجاز است) یا سریال تاریخ Excel.</li>
+      <li>هر ردیف یک بازه دارد (start تا end، هر دو شامل)؛ برای ثبت ماهانه می‌توانید به‌جای آن ستون period (مثل 1404-03) بگذارید.</li>
+      <li>در قالب عریض، هر ستون به یک کنتور، جریان یا متغیر نگاشت می‌شود؛ ردیف‌های خطادار گزارش و بقیه ذخیره می‌شوند.</li></ul>
+    <div id="fileResult"></div></div>`;
+  },
+  async api(streams, vars, meters, ro) {
+    const keys = ro ? [] : await api(`/api/sites/${state.siteId}/api-keys`);
+    const o = location.origin, ex = { variable: "stream_volume", stream: streams[0]?.name || "نام جریان", start: "1404/03/01", end: "1404/03/31", value: 15230 };
+    return html`${ro ? "" : html`<div class="card"><h3>کلیدهای API این مجتمع</h3>
+      <form data-form="apikey" class="form"><label>نام کلید (مثلاً سامانه SCADA)<input name="name" required></label><div><button class="btn primary">ساخت کلید</button></div></form>
+      <div id="newKey"></div>
+      <table><tr><th>نام</th><th>پیشوند</th><th>ساخته‌شده</th><th>آخرین استفاده</th><th>وضعیت</th><th></th></tr>
+      ${keys.map(k => html`<tr><td>${k.name}</td><td dir="ltr">${k.prefix}…</td><td>${k.created_at}</td><td>${k.last_used_at || "—"}</td><td>${k.revoked ? "ابطال‌شده" : "فعال"}</td>
+        <td>${k.revoked ? "" : html`<button class="btn small danger" data-act="revokekey" data-id="${k.id}">ابطال</button>`}</td></tr>`)}</table></div>`}
+    <div class="card"><h3>راهنمای اتصال API</h3>
+      <p class="muted small">سامانه‌های بیرونی (SCADA، ERP، گیت‌وی IoT) داده را با هدر <code dir="ltr">X-API-Key</code> می‌فرستند. هر کلید فقط به همین مجتمع اجازه نوشتن می‌دهد.</p>
+      <h4>ارسال مقادیر بازه‌ای</h4>
+      <pre dir="ltr">curl -X POST ${o}/api/ingest/v1/entries \\
+  -H "X-API-Key: aq_..." -H "Content-Type: application/json" \\
+  -d '${JSON.stringify({ calendar: "jalali", entries: [ex] })}'</pre>
+      <p class="small muted">فیلدها: variable, stream (نام/شناسه) یا meter (کد کنتور)، start/end یا period، granularity (اختیاری)، value، quality، corrected_value، uncertainty، calendar (gregorian | jalali).</p>
+      <h4>ارسال قرائت خام کنتور (شمارنده تجمعی یا دبی لحظه‌ای)</h4>
+      <pre dir="ltr">curl -X POST ${o}/api/ingest/v1/meter-reads \\
+  -H "X-API-Key: aq_..." -H "Content-Type: application/json" \\
+  -d '{"meter": "${meters[0]?.code || "کد-کنتور"}", "reads": [{"ts": "2025-06-01T08:00:00+03:30", "value": 12345.6}]}'</pre>
+      <p class="small muted">برنامه از قرائت‌ها مصرف روزانه‌ی <b>روزهای کامل</b> را حساب و ذخیره می‌کند (درون‌یابی در مرز روز؛ فاصله زیاد بین قرائت‌ها = «تخمینی»؛ کاهش شمارنده = ریست/سرریز). برای کنتور، «نوع قرائت» را در تب کنتورها تنظیم کنید.</p>
+      <pre dir="ltr">GET ${o}/api/ingest/v1/ping   # آزمایش کلید</pre></div>`;
+  },
+  async meters(streams, vars, meters, ro) {
+    const [sum, inst] = await Promise.all([api(`/api/sites/${state.siteId}/meters/summary`), Promise.resolve(cat().instruments || [])]);
+    const catName = k => (cat().source_categories.find(x => x.code === k) || {}).name || k;
+    const glabel = g => g.label || `${g.direction === "in" ? "ورودی" : "خروجی"}: ${KIND_FA[g.kind] || g.kind}`;
+    const em = VIEWS.data.editMeter ? meters.find(m => m.id === VIEWS.data.editMeter) : null; const c = em ? em.config : {};
+    const F = (k, d = "") => c[k] ?? d;
+    const sel = (name, opts, cur) => html`<select name="${name}">${opts.map(([k, t]) => html`<option value="${k}" ${String(k) === String(cur) ? "selected" : ""}>${t}</option>`)}</select>`;
+    return html`<div class="card"><h3>تعداد کنتورها بر حسب نوع منبع</h3>
+      <p class="muted small">هر منبع آب (چاه، شبکه شهری، تانکر، باران، پساب بازیافتی، …) می‌تواند چند کنتور داشته باشد؛ حجم جریان = مجموع کنتورها و عدم‌قطعیت مؤثر از ترکیب خطای هر کنتور محاسبه می‌شود.</p>
+      <table><tr><th>نوع منبع</th><th>جریان‌ها</th><th>کنتورها</th><th>دستی</th><th>API</th><th>اتصال مستقیم</th><th>جریان بدون کنتور</th></tr>
+      ${sum.groups.map(g => html`<tr><td>${glabel(g)}</td><td class="num">${g.streams}</td><td class="num"><b>${g.meters}</b></td><td class="num">${g.manual}</td><td class="num">${g.api}</td><td class="num">${g.direct}</td><td class="num">${g.streams_without_meter}</td></tr>`)}
+      <tr><th>جمع</th><th class="num">${sum.groups.reduce((a, g) => a + g.streams, 0)}</th><th class="num">${sum.total_meters}</th><th></th><th></th><th></th><th class="num">${sum.streams_without_meter}</th></tr></table></div>
+    <div class="card"><h3>کنتورهای ثبت‌شده</h3><div class="tablewrap"><table><tr><th>کد</th><th>جریان / منبع</th><th>نوع</th><th>روش اتصال</th><th>ضریب</th><th>عدم‌قطعیت</th><th>وضعیت اتصال</th><th>قرائت‌ها / ردیف‌ها</th><th></th></tr>
+      ${meters.map(m => html`<tr><td dir="ltr"><b>${m.code}</b>${m.name ? html`<br><span class="small muted">${m.name}</span>` : ""}</td><td>${m.stream_name}<br><span class="small muted">${m.source_category ? catName(m.source_category) : (KIND_FA[m.stream_kind] || "")}</span></td>
+        <td class="small">${(inst.find(i => i.code === m.meter_type) || {}).name_fa || m.meter_type}</td><td class="small">${CONN_FA[m.connection]}${m.enabled ? "" : " (غیرفعال)"}</td>
+        <td class="num">${fmt(m.multiplier, 4)}</td><td class="num">${fmt(m.uncertainty_pct, 2)}٪</td>
+        <td class="small">${m.connection === "manual" ? "—" : html`${m.last_status || "بدون قرائت"}<br><span class="muted">${m.last_poll_at || ""}</span>`}</td>
+        <td class="num">${m.n_reads} / ${m.n_entries}</td>
+        <td>${ro ? "" : html`<button class="btn small" data-act="editmeter" data-id="${m.id}">ویرایش</button>
+          ${m.connection === "direct" && state.user.role === "admin" ? html`<button class="btn small" data-act="testmeter" data-id="${m.id}">آزمون اتصال</button><button class="btn small" data-act="pollmeter" data-id="${m.id}">قرائت اکنون</button>` : ""}
+          ${m.connection !== "manual" ? html`<button class="btn small" data-act="foldmeter" data-id="${m.id}" title="تبدیل قرائت‌های ذخیره‌شده به مصرف روزانه">تبدیل به روزانه</button>` : ""}
+          <button class="btn small danger" data-act="delmeter" data-id="${m.id}">حذف</button>`}</td></tr>`)}</table></div>
+      ${meters.length ? "" : html`<p class="muted">هنوز کنتوری ثبت نشده است.</p>`}<div id="meterOut"></div></div>
+    ${ro ? "" : html`<div class="card"><h3>${em ? "ویرایش کنتور " + em.code : "افزودن کنتور"}</h3>
+      <form data-form="meter" class="form" data-id="${em ? em.id : ""}">
+        <label>جریان / منبع آب<select name="stream_id">${streams.map(s => html`<option value="${s.id}" ${em && em.stream_id === s.id ? "selected" : ""}>${s.name} — ${s.source_category ? catName(s.source_category) : (KIND_FA[s.kind] || s.kind)}</option>`)}</select></label>
+        <label>کد / برچسب کنتور<input name="code" required value="${em?.code || ""}" dir="ltr" placeholder="W-01"></label>
+        <label>نام<input name="name" value="${em?.name || ""}"></label>
+        <label>نوع کنتور<select name="meter_type"><option value="other">سایر</option>${inst.map(i => html`<option value="${i.code}" ${em && em.meter_type === i.code ? "selected" : ""}>${i.name_fa}</option>`)}</select></label>
+        <label>روش ورود داده${sel("connection", Object.entries(CONN_FA), em?.connection || "manual")}</label>
+        <label>ضریب تبدیل به m³ (مثلاً لیتر → 0.001)<input name="multiplier" type="number" step="any" min="0" value="${em?.multiplier ?? 1}"></label>
+        <label>عدم‌قطعیت (٪) — خالی = همان مقدار جریان<input name="uncertainty_pct" type="number" step="any" min="0" max="100" value="${em ? em.uncertainty_pct : ""}"></label>
+        <label>شماره سریال<input name="serial" value="${em?.serial || ""}"></label>
+        <label>محل نصب<input name="location" value="${em?.location || ""}"></label>
+        <label>تاریخ نصب ${dtField("installed_at", em && em.installed_at ? em.installed_at : "", calOf())}</label>
+        <label>توضیحات<input name="notes" value="${em?.notes || ""}"></label>
+        <label class="chk"><input type="checkbox" name="enabled" ${!em || em.enabled ? "checked" : ""}> فعال</label>
+        <fieldset class="cfg" style="grid-column:1/-1"><legend>تنظیمات قرائت</legend><div class="form">
+          <label data-conn="api,direct">نوع مقدار خام${sel("cfg_reading_type", [["totalizer", "شمارنده تجمعی (totalizer)"], ["rate", "دبی لحظه‌ای (rate)"]], F("reading_type", "totalizer"))}</label>
+          <label data-conn="api,direct" data-rt="rate">واحد دبی${sel("cfg_rate_unit", [["m3/h", "m³/h"], ["l/s", "L/s"], ["m3/s", "m³/s"], ["m3/d", "m³/day"], ["l/min", "L/min"]], F("rate_unit", "m3/h"))}</label>
+          <label data-conn="api,direct" data-rt="totalizer">حداکثر شمارنده (برای سرریز؛ اختیاری)<input name="cfg_counter_max" type="number" step="any" value="${F("counter_max")}"></label>
+          <label data-conn="direct">دوره پایش (ثانیه)<input name="cfg_interval_s" type="number" min="5" value="${F("interval_s", 300)}"></label>
+          <label data-conn="direct">پروتکل${sel("cfg_protocol", [["modbus_tcp", "Modbus TCP"], ["http_json", "HTTP / JSON"]], F("protocol", "modbus_tcp"))}</label>
+          <label data-conn="direct" data-proto="modbus_tcp">آدرس دستگاه (host/IP)<input name="cfg_host" value="${F("host")}" dir="ltr" placeholder="192.168.1.50"></label>
+          <label data-conn="direct" data-proto="modbus_tcp">پورت<input name="cfg_port" type="number" value="${F("port", 502)}"></label>
+          <label data-conn="direct" data-proto="modbus_tcp">Unit ID<input name="cfg_unit_id" type="number" value="${F("unit_id", 1)}"></label>
+          <label data-conn="direct" data-proto="modbus_tcp">تابع${sel("cfg_function", [[3, "03 Holding"], [4, "04 Input"]], F("function", 3))}</label>
+          <label data-conn="direct" data-proto="modbus_tcp">آدرس ثبات<input name="cfg_register" type="number" min="0" value="${F("register", 0)}"></label>
+          <label data-conn="direct" data-proto="modbus_tcp">نوع داده${sel("cfg_datatype", ["uint16", "int16", "uint32", "int32", "float32", "float64"].map(x => [x, x]), F("datatype", "float32"))}</label>
+          <label data-conn="direct" data-proto="modbus_tcp">ترتیب کلمه‌ها${sel("cfg_word_order", [["big", "big"], ["little", "little"]], F("word_order", "big"))}</label>
+          <label data-conn="direct" data-proto="modbus_tcp">ترتیب بایت‌ها${sel("cfg_byte_order", [["big", "big"], ["little", "little"]], F("byte_order", "big"))}</label>
+          <label data-conn="direct" data-proto="http_json" style="grid-column:1/-1">نشانی (URL)<input name="cfg_url" value="${F("url")}" dir="ltr" placeholder="http://192.168.1.60/api/meter"></label>
+          <label data-conn="direct" data-proto="http_json">مسیر مقدار در JSON<input name="cfg_json_path" value="${F("json_path")}" dir="ltr" placeholder="data.total_m3"></label>
+          <label data-conn="direct">مقیاس خام<input name="cfg_scale" type="number" step="any" value="${F("scale", 1)}"></label>
+          <label data-conn="direct">جابه‌جایی (offset)<input name="cfg_offset" type="number" step="any" value="${F("offset", 0)}"></label>
+        </div><p class="small muted" data-conn="direct">اتصال مستقیم فقط توسط مدیر تنظیم می‌شود. دستگاه باید از رایانه‌ی اجراکننده‌ی برنامه در دسترس باشد؛ برنامه به‌صورت دوره‌ای قرائت می‌کند (تا زمانی که اجرا باشد).</p></fieldset>
+        <div><button class="btn primary">${em ? "ذخیره تغییرات" : "افزودن کنتور"}</button>${em ? html` <button type="button" class="btn" data-act="editmeter" data-id="">انصراف</button>` : ""}</div></form></div>`}`;
+  },
+  async list(streams, vars, meters, ro) {
+    const f = VIEWS.data.filter || {}, cal = calOf(); const qs = new URLSearchParams({ calendar: cal, limit: 500 });
+    for (const k of ["variable", "stream_id", "source"]) if (f[k]) qs.set(k, f[k]);
+    if (f.from) qs.set("from", fmtDate(cal, f.from)); if (f.to) qs.set("to", fmtDate(cal, f.to));
+    const r = await api(`/api/sites/${state.siteId}/ts/entries?${qs}`);
+    return html`<div class="card"><h3>فیلتر</h3><form data-form="tsfilter" class="form">
+      <label>متغیر<select name="variable"><option value="">همه</option>${vars.map(x => html`<option value="${x.code}" ${f.variable === x.code ? "selected" : ""}>${x.name_fa}</option>`)}</select></label>
+      <label>جریان<select name="stream_id"><option value="">همه</option>${streams.map(s => html`<option value="${s.id}" ${String(f.stream_id) === String(s.id) ? "selected" : ""}>${s.name}</option>`)}</select></label>
+      <label>منبع داده<select name="source"><option value="">همه</option>${Object.entries(SRC_FA).map(([k, t]) => html`<option value="${k}" ${f.source === k ? "selected" : ""}>${t}</option>`)}</select></label>
+      <label>تقویم نمایش${calSelect("calendar", cal)}</label>
+      <label>از ${dtField("from", f.from || "", cal)}</label><label>تا ${dtField("to", f.to || "", cal)}</label>
+      <div><button class="btn primary">اعمال</button> <button type="button" class="btn" data-act="clearfilter">پاک کردن</button></div></form></div>
+    <div class="card"><h3>داده‌های ثبت‌شده (${fmt(r.total, 0)} ردیف${r.total > r.items.length ? "؛ ۵۰۰ ردیف آخر" : ""})</h3>
+      ${ro ? "" : html`<p><button class="btn small danger" data-act="tsdel">حذف ردیف‌های انتخاب‌شده</button></p>`}
+      <div class="tablewrap" style="max-height:520px"><table><tr>${ro ? "" : html`<th></th>`}<th>متغیر</th><th>جریان / کنتور</th><th>از</th><th>تا</th><th>دانه‌بندی</th><th>مقدار</th><th>وضعیت</th><th>منبع</th></tr>
+      ${r.items.map(e => html`<tr>${ro ? "" : html`<td><input type="checkbox" data-eid="${e.id}"></td>`}<td>${e.variable_name || e.variable}</td><td>${e.stream_name || ""}${e.meter_code ? html` <span dir="ltr" class="muted">[${e.meter_code}]</span>` : ""}</td>
+        <td dir="ltr">${e.start_fmt}</td><td dir="ltr">${e.end_fmt}</td><td>${GRAN_FA[e.granularity]}</td><td class="num">${fmt(e.corrected_value ?? e.value, 3)} <span class="muted small">${e.unit || ""}</span></td>
+        <td>${QUAL_FA[e.quality]}</td><td>${SRC_FA[e.source] || e.source}</td></tr>`)}</table></div></div>`;
+  },
+  async vars(streams, vars, meters, ro) {
+    const cov = await api(`/api/sites/${state.siteId}/ts/coverage`);
+    return html`<div class="card"><h3>پوشش داده هر متغیر</h3><div class="tablewrap"><table><tr><th>متغیر</th><th>جریان</th><th>نخستین دوره</th><th>آخرین دوره</th><th>تعداد دوره</th><th>دوره‌های ناقص</th><th>ماه‌های بدون داده (شکاف)</th></tr>
+      ${cov.map(c => html`<tr><td>${c.variable_name || c.variable}</td><td>${c.stream_name || "—"}</td><td dir="ltr">${c.first_period}</td><td dir="ltr">${c.last_period}</td><td class="num">${c.n_periods}</td>
+        <td class="num ${c.n_partial ? "warn" : ""}">${c.n_partial}</td><td class="small" dir="ltr">${c.n_gaps ? c.gaps.join("، ") + (c.n_gaps > c.gaps.length ? "…" : "") : "—"}</td></tr>`)}</table></div>
+      <p class="small muted">کلید دوره‌ها (YYYY-MM) در تقویم گزارش‌گیری مجتمع (${CAL_FA[site()?.calendar || "gregorian"]}) است؛ آن را در «ساختار سیستم آب مجتمع» می‌توانید تغییر دهید. ماه ناقص = بخشی از روزهای آن داده ندارد.</p></div>
+    <div class="card"><h3>متغیرها و پارامترهای سری زمانی</h3><div class="tablewrap" style="max-height:380px"><table><tr><th>کد</th><th>نام</th><th>واحد</th><th>نحوه تجمیع به ماه</th><th>سطح</th><th>منبع</th></tr>
+      ${vars.map(x => html`<tr><td dir="ltr">${x.code}</td><td>${x.name_fa}</td><td>${x.unit}</td><td>${x.agg === "sum" ? "جمع (توزیع متناسب با روز)" : "میانگین وزنی با روز"}</td><td>${x.entity === "stream" ? "جریان" : "مجتمع"}</td><td>${x.source === "user" ? "کاربر" : "داخلی"}</td></tr>`)}</table></div>
+      ${ro ? "" : html`<h4>افزودن متغیر سطح مجتمع (مثلاً انرژی، بخار تولیدی، بارندگی ایستگاه)</h4>
+      <form data-form="tsvar" class="form"><label>کد (a-z, 0-9, _)<input name="code" required pattern="[a-z][a-z0-9_]{1,40}" dir="ltr"></label><label>نام فارسی<input name="name_fa" required></label>
+        <label>واحد<input name="unit"></label><label>تجمیع<select name="agg"><option value="sum">جمع‌پذیر</option><option value="mean">میانگین</option></select></label>
+        <div><button class="btn primary">افزودن</button></div></form>
+      <p class="small muted">متغیرهای سطح مجتمع در فرمول شاخص‌ها (با نام کد) و در خط مبنا قابل استفاده‌اند.</p>`}</div>`;
+  },
+};
+
+function refreshCtl(f) {
+  if (!f) return; const m = varMeta(f.variable.value) || {}; const isStream = m.entity === "stream";
+  f.querySelector("[data-show=stream]").hidden = !isStream;
+  f.querySelector("[data-show=meter]").hidden = !(isStream && m.code === "stream_volume");
+  f.querySelector("[data-show=custom]").hidden = f.granularity.value !== "custom";
+  const st = f.stream_id.value;
+  [...f.meter_id.options].forEach(o => { o.hidden = !!o.value && o.dataset.stream !== st; });
+  if (f.meter_id.selectedOptions[0]?.hidden) f.meter_id.value = "";
+}
+function refreshMeterForm(f) {
+  if (!f) return; const conn = f.connection.value, proto = f.cfg_protocol.value, rt = f.cfg_reading_type.value;
+  f.querySelectorAll("[data-conn]").forEach(el => {
+    let show = el.dataset.conn.split(",").includes(conn);
+    if (show && el.dataset.proto) show = el.dataset.proto === proto;
+    if (show && el.dataset.rt) show = el.dataset.rt === rt;
+    el.hidden = !show;
+  });
+}
+$("#view").addEventListener("change", e => {
+  const f = e.target.closest("form"); if (!f || !VIEWS.data.ctx) return;
+  if (e.target.name === "calendar") { setCal(e.target.value); if (f.querySelector(".dt")) convertDates(f, e.target.value); }
+  if (f.dataset.form === "tsctl") refreshCtl(f);
+  if (f.dataset.form === "meter") refreshMeterForm(f);
+});
+$("#view").addEventListener("paste", e => {  // چسباندن ستونی از Excel در جدول مقادیر
+  const inp = e.target.closest("input[data-k=value]"); if (!inp) return;
+  const parts = (e.clipboardData?.getData("text") || "").trim().split(/[\r\n\t]+/).map(s => s.trim().replace(/,/g, "")).filter(s => s !== "");
+  if (parts.length < 2) return; e.preventDefault();
+  const all = [...document.querySelectorAll("#grid input[data-k=value]")]; let i = all.indexOf(inp);
+  for (const p of parts) { if (i >= all.length) break; all[i++].value = p; }
+});
+
+const DATA_FORMS = {
+  async tsctl(f) {
+    const d = formData(f); const m = varMeta(d.variable); const cal = d.calendar; setCal(cal);
+    const sp = n => f.querySelector(`.dt[data-name=${n}]`); const start = dtISO(sp("start")), end = dtISO(sp("end"));
+    if (!start || !end) throw new Error("تاریخ شروع و پایان را کامل و معتبر وارد کنید");
+    const req = { calendar: "gregorian", start, end, granularity: d.granularity };
+    if (d.granularity === "custom") req.step_days = d.step_days ? Number(d.step_days) : (Math.round((Date.parse(end) - Date.parse(start)) / 864e5) + 1);
+    // دوره‌های کامل تقویمی در تقویم انتخاب‌شده (سال/ماه شمسی یا میلادی)
+    if (d.granularity === "year" || d.granularity === "month") { req.calendar = cal; req.start = fmtDate(cal, start); req.end = fmtDate(cal, end); }
+    const per = await api(`/api/sites/${state.siteId}/ts/periods`, { method: "POST", body: req });
+    const ctl = { variable: d.variable, stream_id: m.entity === "stream" ? Number(d.stream_id) : 0, meter_id: m.code === "stream_volume" && d.meter_id ? Number(d.meter_id) : 0, granularity: d.granularity, cal };
+    const qs = new URLSearchParams({ variable: ctl.variable, calendar: "gregorian", limit: 5000, from: per.periods[0].start, to: per.periods[per.periods.length - 1].end });
+    if (ctl.stream_id) qs.set("stream_id", ctl.stream_id); if (ctl.meter_id) qs.set("meter_id", ctl.meter_id);
+    const ex = (await api(`/api/sites/${state.siteId}/ts/entries?${qs}`)).items.filter(e => e.meter_id === ctl.meter_id);
+    const byKey = Object.fromEntries(ex.map(e => [e.start_date + "|" + e.end_date, e]));
+    VIEWS.data.grid = { ctl, periods: per.periods, meta: m };
+    const quals = Object.entries(QUAL_FA);
+    $("#grid").innerHTML = html`<p class="small muted">${per.periods.length} دوره — ${m.name_fa} (${m.unit || "—"})${ctl.stream_id ? " — " + (VIEWS.data.ctx.streams.find(s => s.id === ctl.stream_id) || {}).name : ""}${ctl.meter_id ? " — کنتور " + (VIEWS.data.ctx.meters.find(x => x.id === ctl.meter_id) || {}).code : ""}. ردیف‌های خالی ذخیره نمی‌شوند.</p>
+      <div class="tablewrap" style="max-height:420px"><table class="gridt"><tr><th>دوره</th><th>بازه (${CAL_FA[cal]})</th><th>روز</th><th>مقدار</th><th>وضعیت</th>${m.code === "storage_delta" ? html`<th>عدم‌قطعیت</th>` : ""}</tr>
+      ${per.periods.map((p, i) => { const e = byKey[p.start + "|" + p.end]; return html`<tr data-i="${i}"><td dir="ltr">${p.label}</td><td dir="ltr" class="small">${fmtDate(cal, p.start)} ← ${fmtDate(cal, p.end)}</td><td class="num">${p.days}</td>
+        <td><input data-k="value" type="text" inputmode="decimal" value="${e ? (e.corrected_value ?? e.value) : ""}" dir="ltr"></td>
+        <td><select data-k="quality">${quals.map(([k, t]) => html`<option value="${k}" ${e && e.quality === k ? "selected" : ""}>${t}</option>`)}</select></td>
+        ${m.code === "storage_delta" ? html`<td><input data-k="unc" type="number" step="any" min="0" value="${e ? e.uncertainty : 0}" dir="ltr"></td>` : ""}</tr>`; })}</table></div>
+      <p><label class="chk"><input type="checkbox" id="gridReplace"> جایگزینی داده‌های هم‌پوشان (مثلاً جایگزین کردن مقدار ماهانه با روزانه)</label></p>
+      <p><button class="btn primary" data-act="tssave">ذخیره مقادیر</button> <button class="btn" data-act="tsclear">پاک کردن مقادیر</button></p>`.__raw;
+    $("#gridCard").hidden = false; $("#gridOut").innerHTML = ""; $("#grid input[data-k=value]")?.focus();
+  },
+  async file(f) {
+    const d = formData(f); const fd = new FormData(); fd.append("file", f.file.files[0]);
+    const r = await api(`/api/sites/${state.siteId}/import?type=${d.type}&calendar=${d.calendar}${d.replace ? "&replace=1" : ""}`, { method: "POST", body: fd }).catch(e => (e.data && e.data.errors) ? e.data : ({ saved: 0, errors: [{ line: "-", error: e.message }] }));
+    $("#fileResult").innerHTML = html`<p class="${r.saved ? "ok" : "err"}">${r.saved} ردیف ذخیره شد${r.entries_saved && r.entries_saved !== r.saved ? ` (${r.entries_saved} مقدار)` : ""}${r.errors.length ? "، " + r.errors.length + " خطا" : ""}.</p>
+      ${r.errors.length ? html`<div class="tablewrap" style="max-height:260px"><table><tr><th>ردیف فایل</th><th>خطا</th></tr>${r.errors.slice(0, 100).map(x => html`<tr><td>${x.line}</td><td>${x.error}</td></tr>`)}</table></div>` : ""}`.__raw;
+    if (r.saved) toast("داده‌ها ذخیره شد");
+  },
+  async apikey(f) {
+    const r = await api(`/api/sites/${state.siteId}/api-keys`, { method: "POST", body: formData(f) });
+    $("#newKey").innerHTML = html`<div class="note"><b>کلید جدید (فقط همین بار نمایش داده می‌شود):</b><br><code dir="ltr" style="user-select:all">${r.key}</code><br><span class="small">${r.note}</span></div>`.__raw;
+    f.reset();
+  },
+  async meter(f) {
+    const d = formData(f); const id = f.dataset.id; const conn = d.connection;
+    const sp = f.querySelector(".dt[data-name=installed_at]"); const inst = sp ? dtISO(sp) : null;
+    const cfg = {}; const num_ = k => d["cfg_" + k] === "" || d["cfg_" + k] == null ? undefined : Number(d["cfg_" + k]);
+    cfg.reading_type = d.cfg_reading_type; cfg.rate_unit = d.cfg_rate_unit; if (d.cfg_counter_max !== "") cfg.counter_max = Number(d.cfg_counter_max);
+    if (conn === "direct") Object.assign(cfg, { protocol: d.cfg_protocol, interval_s: num_("interval_s"), host: d.cfg_host, port: num_("port"), unit_id: num_("unit_id"),
+      function: num_("function"), register: num_("register"), datatype: d.cfg_datatype, word_order: d.cfg_word_order, byte_order: d.cfg_byte_order,
+      url: d.cfg_url, json_path: d.cfg_json_path, scale: num_("scale"), offset: num_("offset") });
+    const body = { stream_id: Number(d.stream_id), code: d.code, name: d.name, meter_type: d.meter_type, connection: conn, multiplier: Number(d.multiplier || 1),
+      serial: d.serial, location: d.location, installed_at: inst || "", notes: d.notes, enabled: !!d.enabled, config: cfg };
+    if (d.uncertainty_pct !== "") body.uncertainty_pct = Number(d.uncertainty_pct);
+    if (id) await api(`/api/sites/${state.siteId}/meters/${id}`, { method: "PUT", body }); else await api(`/api/sites/${state.siteId}/meters`, { method: "POST", body });
+    VIEWS.data.editMeter = null; toast("کنتور ذخیره شد"); render();
+  },
+  async tsfilter(f) {
+    const d = formData(f); const sp = n => f.querySelector(`.dt[data-name=${n}]`);
+    VIEWS.data.filter = { variable: d.variable, stream_id: d.stream_id, source: d.source, from: dtISO(sp("from")) || "", to: dtISO(sp("to")) || "" }; setCal(d.calendar); render();
+  },
+  async tsvar(f) { await api("/api/variables", { method: "POST", body: formData(f) }); toast("متغیر افزوده شد"); render(); },
+};
+const DATA_ACTS = {
+  datatab(b) { VIEWS.data.tab = b.dataset.id; render(); },
+  async tssave(b) {
+    const g = VIEWS.data.grid; if (!g) return; const items = [];
+    document.querySelectorAll("#grid tr[data-i]").forEach(tr => {
+      const val = tr.querySelector("[data-k=value]").value.trim(); if (val === "") return; const p = g.periods[+tr.dataset.i];
+      const it = { variable: g.ctl.variable, start: p.start, end: p.end, granularity: g.ctl.granularity, value: val, quality: tr.querySelector("[data-k=quality]").value };
+      if (g.ctl.stream_id) it.stream_id = g.ctl.stream_id; if (g.ctl.meter_id) it.meter_id = g.ctl.meter_id;
+      const u = tr.querySelector("[data-k=unc]"); if (u && u.value !== "") it.uncertainty = Number(u.value);
+      items.push(it);
+    });
+    if (!items.length) throw new Error("هیچ مقداری وارد نشده است");
+    const r = await api(`/api/sites/${state.siteId}/ts/entries`, { method: "POST", body: { items, calendar: "gregorian", replace_overlaps: $("#gridReplace").checked } }).catch(e => (e.data && e.data.errors) ? e.data : ({ saved: 0, errors: [{ line: "-", error: e.message }] }));
+    const bad = new Set(r.errors.map(x => x.line));
+    document.querySelectorAll("#grid tr[data-i]").forEach(tr => tr.classList.remove("rowbad"));
+    $("#gridOut").innerHTML = html`<p class="${r.saved ? "ok" : "err"}">${r.saved} مقدار ذخیره شد${r.errors.length ? "، " + r.errors.length + " خطا" : ""}.</p>
+      ${r.errors.length ? html`<table><tr><th>ردیف ارسالی</th><th>خطا</th></tr>${r.errors.map(x => html`<tr><td>${x.line}</td><td>${x.error}</td></tr>`)}</table>` : ""}`.__raw;
+    if (r.saved) toast("ذخیره شد", false);
+  },
+  tsclear() { document.querySelectorAll("#grid input[data-k=value]").forEach(i => i.value = ""); },
+  clearfilter() { VIEWS.data.filter = {}; render(); },
+  async tsdel() {
+    const ids = [...document.querySelectorAll("input[data-eid]:checked")].map(x => Number(x.dataset.eid));
+    if (!ids.length) throw new Error("ردیفی انتخاب نشده است");
+    if (!confirm(`${ids.length} ردیف حذف شود؟`)) return;
+    await api(`/api/sites/${state.siteId}/ts/entries/delete`, { method: "POST", body: { ids } }); toast("حذف شد"); render();
+  },
+  async tpl(b) {
+    const r = await api(`/api/sites/${state.siteId}/ts/template?layout=${b.dataset.layout}&format=${b.dataset.format}&calendar=${calOf()}`, { raw: true });
+    const url = URL.createObjectURL(await r.blob()); const a = document.createElement("a");
+    a.href = url; a.download = `aquaaudit-template-${b.dataset.layout}.${b.dataset.format}`; document.body.appendChild(a); a.click(); a.remove();
+  },
+  async revokekey(b) { if (confirm("کلید ابطال شود؟ سامانه‌هایی که از آن استفاده می‌کنند دیگر کار نمی‌کنند.")) { await api(`/api/sites/${state.siteId}/api-keys/${b.dataset.id}`, { method: "DELETE" }); render(); } },
+  editmeter(b) { VIEWS.data.editMeter = b.dataset.id ? Number(b.dataset.id) : null; render(); },
+  async delmeter(b) { if (confirm("کنتور و تمام داده‌های ثبت‌شده برای آن حذف شود؟")) { await api(`/api/sites/${state.siteId}/meters/${b.dataset.id}`, { method: "DELETE" }); render(); } },
+  async testmeter(b) {
+    const r = await api(`/api/sites/${state.siteId}/meters/${b.dataset.id}/test`, { method: "POST" });
+    $("#meterOut").innerHTML = html`<p class="ok">اتصال برقرار است؛ مقدار خوانده‌شده: <b dir="ltr">${fmt(r.raw, 4)}</b></p>`.__raw;
+  },
+  async pollmeter(b) {
+    const r = await api(`/api/sites/${state.siteId}/meters/${b.dataset.id}/poll`, { method: "POST" });
+    $("#meterOut").innerHTML = html`<p class="${r.status === "ok" ? "ok" : "err"}">${r.status === "ok" ? "قرائت ذخیره شد: " + fmt(r.raw, 4) + " — روزهای کامل تبدیل‌شده: " + (r.days ?? 0) : r.status}</p>`.__raw;
+  },
+  async foldmeter(b) {
+    const r = await api(`/api/sites/${state.siteId}/meters/${b.dataset.id}/fold`, { method: "POST" });
+    $("#meterOut").innerHTML = html`<p class="ok">${r.days} روز کامل از قرائت‌ها محاسبه و ${r.saved} ردیف ذخیره شد.${r.errors.length ? " خطا: " + r.errors.map(x => x.error).join("؛ ") : ""}</p>`.__raw;
+  },
 };
 
 VIEWS.balance = async v => {
@@ -774,6 +1078,7 @@ function renderBlankSite() {
   VIEWS.structure($("#view"));
 }
 $("#view").addEventListener("click", e => { const b = e.target.closest("[data-act]"); if (b && b.tagName !== "SELECT" && ACTS[b.dataset.act]) guard(() => ACTS[b.dataset.act](b))(); });
+Object.assign(FORMS, DATA_FORMS); Object.assign(ACTS, DATA_ACTS);
 $("#view").addEventListener("change", e => {
   const es = e.target.closest("select[data-act=eqsys]"); if (es) return ACTS.eqsys(es);
   const ind = e.target.closest("form[data-form=site] select[name=industry_code]");

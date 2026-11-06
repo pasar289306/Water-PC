@@ -59,3 +59,20 @@ select[multiple]{min-height:4.5rem}
 .sk-t{fill:var(--ink);font-size:12px}.sk-v{fill:var(--muted);font-size:11px}
 .sk-wrap{overflow:auto}
 .sk-wrap svg{min-width:640px;width:100%;height:auto;direction:ltr}
+
+/* ---- ورود داده سری زمانی ---- */
+.ok{color:var(--ok);margin:.5rem 0}
+.warn{color:var(--warn)}
+.dt{display:inline-flex;gap:.3rem;align-items:center;flex-wrap:nowrap}
+.dt .dy{width:4.4rem;min-width:4.4rem;flex:none}.dt .dd{width:3.4rem;min-width:3.4rem;flex:none}.dt .dm{min-width:6.5rem;flex:1}
+.form:has(.dt){grid-template-columns:repeat(auto-fit,minmax(16rem,1fr))}
+label.chk{display:flex;gap:.5rem;align-items:center;align-self:end;padding-bottom:.5rem}
+label.chk input{width:auto}
+fieldset.cfg{border:1px solid var(--line);border-radius:10px;padding:.6rem .8rem;margin:0}
+fieldset.cfg legend{padding:0 .4rem;color:var(--muted,#666);font-size:.85rem}
+[hidden]{display:none!important}
+table.gridt input[data-k=value]{width:9rem;text-align:left}
+table.gridt select{min-width:6.5rem}
+pre{background:var(--chip);border-radius:8px;padding:.7rem .9rem;overflow:auto;font-size:.82rem;white-space:pre-wrap;word-break:break-all}
+code{background:var(--chip);border-radius:5px;padding:.1rem .35rem}
+@media (max-width:640px){.dt{flex-wrap:wrap}}
